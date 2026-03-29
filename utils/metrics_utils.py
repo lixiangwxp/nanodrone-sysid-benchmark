@@ -82,8 +82,9 @@ def compute_errors(df, max_horizon):
 # === Compute cumulative simulation error (sum over h=1..50)
 # ============================================================
 def compute_simerr(metric_dict):
-    sim_p = sum(metric_dict["pos"][h] for h in range(1, 51))
-    sim_v = sum(metric_dict["vel"][h] for h in range(1, 51))
-    sim_R = sum(metric_dict["rot"][h] for h in range(1, 51))
-    sim_w = sum(metric_dict["omega"][h] for h in range(1, 51))
+    horizons = sorted(metric_dict["pos"].keys())
+    sim_p = sum(metric_dict["pos"][h] for h in horizons)
+    sim_v = sum(metric_dict["vel"][h] for h in horizons)
+    sim_R = sum(metric_dict["rot"][h] for h in horizons)
+    sim_w = sum(metric_dict["omega"][h] for h in horizons)
     return sim_p, sim_v, sim_R, sim_w

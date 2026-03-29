@@ -40,7 +40,7 @@ def print_latex_table_results(rows, H_TARGETS):
             [f"$p_{{h={h}}}$" for h in H_TARGETS] + [r"$\textit{p_{h=1{:}50}}$"] +
             [f"$v_{{h={h}}}$" for h in H_TARGETS] + [r"$\textit{v_{h=1{:}50}}$"] +
             [f"$R_{{h={h}}}$" for h in H_TARGETS] + [r"$\textit{R_{h=1{:}50}}$"] +
-            [f"$\omega_{{h={h}}}$" for h in H_TARGETS] + [r"$\textit{\omega_{h=1{:}50}}$"]
+            [fr"$\omega_{{h={h}}}$" for h in H_TARGETS] + [r"$\textit{\omega_{h=1{:}50}}$"]
     )
 
     df = pd.DataFrame(rows, columns=columns)
@@ -73,7 +73,15 @@ def print_latex_table_results(rows, H_TARGETS):
     ).strip()
 
     lines = latex_body.splitlines()
-    data_rows = lines[1:-1]
+    data_rows = [
+        line for line in lines
+        if line.strip()
+        and not line.lstrip().startswith(r"\begin{tabular}")
+        and not line.lstrip().startswith(r"\toprule")
+        and not line.lstrip().startswith(r"\midrule")
+        and not line.lstrip().startswith(r"\bottomrule")
+        and not line.lstrip().startswith(r"\end{tabular}")
+    ]
 
     latex_final = r"""
     \begin{table*}[t]

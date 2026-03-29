@@ -1,22 +1,35 @@
-import os
-import torch
+import argparse
+import json
+import sys
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
+import torch
 from torch.utils.data import ConcatDataset, DataLoader
 
 
-# ---------------------------------------------------------------------
-# === Imports from project ===
-# ---------------------------------------------------------------------
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 from dataset.dataset import QuadDataset, combine_concat_dataset
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-batch_size = 128
-horizon = 50
-dt = 0.01
-model_name = 'baseline'
 
-test_trajs = ["melon"]
+parser = argparse.ArgumentParser(description="Evaluate the naive constant-state baseline")
+parser.add_argument("--test-trajs", type=str, default='["melon"]')
+parser.add_argument("--batch-size", type=int, default=128)
+parser.add_argument("--horizon", type=int, default=50)
+args = parser.parse_args()
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+batch_size = args.batch_size
+horizon = args.horizon
+dt = 0.01
+model_name = "baseline"
+
+test_trajs = json.loads(args.test_trajs)
+data_dir = PROJECT_ROOT / "data" / "test"
 
 print(f"🧪 Test trajectories (auto-selected): {test_trajs}")
 
@@ -27,13 +40,16 @@ test_ds = []
 for traj in test_trajs:
     for run in [1, 2, 3]:
         file_name = f"{traj}_20251017_run{run}.csv"
-        file_path = os.path.join("../data/test/", file_name)
+        file_path = data_dir / file_name
         try:
             df = pd.read_csv(file_path)
             ds = QuadDataset(df, horizon=horizon)
             test_ds.append(ds)
-        except Exception as e:
-            print(f"⚠️ Skipped {file_name}: {e}")
+        except Exception as exc:
+            print(f"⚠️ Skipped {file_name}: {exc}")
+
+if not test_ds:
+    raise RuntimeError(f"❌ No test datasets could be loaded from {data_dir}")
 
 test_dataset = combine_concat_dataset(
     ConcatDataset(test_ds), scale=False
@@ -59,44 +75,32 @@ preds = torch.cat(preds, dim=0).numpy()
 trues = torch.cat(trues, dim=0).numpy()
 
 # =====================================================
-# --- Convert to DataFrame (similar to previous code) ---
+# --- Convert to DataFrame ---
 # =====================================================
-# Build dataframe per time step (naive constant baseline)
 N = preds.shape[0]
 data = {}
 
-# time vector (optional): you can pull from your test dataset
-# e.g. if test_dataset has 't' inside its dataframe:
 if hasattr(test_dataset, "df") and "t" in test_dataset.df.columns:
     t_vec = test_dataset.df["t"].values[:N]
 else:
-    t_vec = np.arange(N) * 0.01  # fallback 100 Hz assumption
+    t_vec = np.arange(N) * dt
 data["t"] = t_vec
 
-# add true states
 for i, name in enumerate(state_names):
-    data[name] = trues[:, 0, i]  # the first step of x_seq_true is x_{t+1}
+    data[name] = trues[:, 0, i]
 
-# add baseline predictions per horizon
 for h in range(1, horizon + 1):
     for i, name in enumerate(state_names):
-        data[f"{name}_pred_h{h}"] = preds[:, h - 1, i]  # each step h
+        data[f"{name}_pred_h{h}"] = preds[:, h - 1, i]
 
 df_pred = pd.DataFrame(data)
-print(f"✅ Baseline DataFrame shape: {df_pred.shape}")
+print(f"✅ Prediction DataFrame shape: {df_pred.shape}")
 
-# Take the first trajectory for visualization
-preds_seq, trues_seq = preds[0], trues[0]
-
-# === Directly use SO(3) log angles ===
-# State structure: [x, y, z, vx, vy, vz, rx, ry, rz, wx, wy, wz]
-preds_plot = preds_seq
-trues_plot = trues_seq
 # =====================================================
-# --- Save baseline results ---
+# --- Save results ---
 # =====================================================
-out_dir = "../out/predictions/baseline_model_multistep/"
-os.makedirs(out_dir, exist_ok=True)
-out_path = os.path.join(out_dir, "_".join(test_trajs) + "_multistep.csv")
-# df_pred.to_csv(out_path, index=False)
+out_dir = PROJECT_ROOT / "out" / "predictions" / "baseline_model_multistep"
+out_dir.mkdir(parents=True, exist_ok=True)
+out_path = out_dir / f"{'_'.join(test_trajs)}_multistep.csv"
+df_pred.to_csv(out_path, index=False)
 print(f"💾 Saved to {out_path}")
