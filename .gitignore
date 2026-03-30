@@ -4,3 +4,18 @@ __pycache__/
 *.pyc
 .ipynb_checkpoints/
 .idea
+.DS_Store
+
+# Large / reproducible run artifacts
+out/models/
+out/predictions/
+out/export/
+out/benchmark_summary.csv
+logs/
+
+# Local experiment backups (not part of canonical repo tree)
+backups/
+
+# Smoke-test & ablation scaler dirs (main scalers e.g. lstm_random_square_chirp stay tracked)
+scalers/*_smoke/
+scalers/physres_ablation__*/

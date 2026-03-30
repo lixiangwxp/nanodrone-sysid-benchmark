@@ -18,6 +18,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from dataset.dataset import QuadDataset, combine_concat_dataset
 from models.models import PhysQuadModel, PhysResQuadModel, ResidualQuadModel
 from train.losses import WeightedMSELoss
+from utils.seed_utils import build_torch_generator, seed_worker, set_global_seed
 
 
 def load_split(trajs, runs, base_dir, split, horizon):
@@ -47,6 +48,7 @@ parser.add_argument("--horizon", type=int, default=50)
 parser.add_argument("--batch-size", type=int, default=256)
 parser.add_argument("--pretrained", action="store_true")
 parser.add_argument("--name-suffix", type=str, default="", help="Optional suffix appended to the auto-generated model name")
+parser.add_argument("--seed", type=int, default=42, help="Random seed used for initialization and DataLoader shuffling")
 args = parser.parse_args()
 
 train_trajs = json.loads(args.train_trajs)
@@ -57,6 +59,7 @@ device_str = args.device
 epochs = args.epochs
 horizon = args.horizon
 batch_size = args.batch_size
+seed = args.seed
 dt = 0.01
 
 model_name = f"phys+res_{'_'.join(train_trajs)}"
@@ -70,6 +73,9 @@ lr_end = 1e-8
 if device_str.startswith("cuda"):
     os.environ["CUDA_VISIBLE_DEVICES"] = device_str.split(":")[-1]
 device = torch.device(device_str if torch.cuda.is_available() else "cpu")
+
+set_global_seed(seed)
+print(f"🌱 Global seed set to: {seed}")
 
 model_dir = PROJECT_ROOT / "out" / "models"
 model_dir.mkdir(parents=True, exist_ok=True)
@@ -96,8 +102,20 @@ with open(traj_info_path, "w") as handle:
     json.dump(traj_info, handle, indent=4)
 print(f"📝 Saved trajectory info to {traj_info_path}")
 
-train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-valid_loader = DataLoader(valid_dataset, batch_size=batch_size, shuffle=False)
+train_loader = DataLoader(
+    train_dataset,
+    batch_size=batch_size,
+    shuffle=True,
+    generator=build_torch_generator(seed),
+    worker_init_fn=seed_worker,
+)
+valid_loader = DataLoader(
+    valid_dataset,
+    batch_size=batch_size,
+    shuffle=False,
+    generator=build_torch_generator(seed),
+    worker_init_fn=seed_worker,
+)
 
 phys_params = {
     "g": 9.81,
@@ -177,6 +195,7 @@ for epoch in range(epochs):
             "val_loss": best_val_loss,
             "train_trajs": train_trajs,
             "valid_trajs": valid_trajs,
+            "seed": seed,
         }
         torch.save(checkpoint, model_path)
         print(f"💾 Saved best model at epoch {best_epoch} with valid loss {avg_valid_loss:.6f}")
