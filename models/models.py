@@ -116,6 +116,29 @@ class PhysQuadModel(BaseQuadModel):
         x_next = torch.cat([pos_next, vel_next, so3_next, omega_next], dim=-1)
         return x_next
 
+    def apply_force(self, x_real, u_mot, delta_f_b, x_phys_next_real=None):
+        """
+        Apply an additional body-frame force on top of the nominal one-step prediction.
+
+        Args:
+            x_real: (B,12) current state in real units.
+            u_mot: (B,4) motor angular speeds in real units.
+            delta_f_b: (B,3) residual body-frame force.
+            x_phys_next_real: optional cached nominal next state from `one_step`.
+        """
+        if x_phys_next_real is None:
+            x_phys_next_real = self.one_step(x_real, u_mot)
+
+        quat = self.so3_log_to_quat(x_real[:, 6:9])
+        delta_f_w = self.quat_rotate(quat, delta_f_b)
+        delta_a_w = delta_f_w / self.m
+
+        x_next_real = x_phys_next_real.clone()
+        vel_delta = self.dt * delta_a_w
+        x_next_real[:, 3:6] = x_next_real[:, 3:6] + vel_delta
+        x_next_real[:, 0:3] = x_next_real[:, 0:3] + self.dt * vel_delta
+        return x_next_real
+
     def _step_from_phys(self, x, u_phys):
         """
         RK4 integration of quadrotor rigid-body dynamics.
@@ -155,7 +178,7 @@ class PhysQuadModel(BaseQuadModel):
 
             # --- rotational dynamics ---
             J_omega = omega @ self.J.T
-            omega_dot = 0.0*torch.linalg.solve(
+            omega_dot = 0.0 * torch.linalg.solve(
                 self.J, (tau - torch.cross(omega, J_omega, dim=-1)).unsqueeze(-1)
             ).squeeze(-1)
 

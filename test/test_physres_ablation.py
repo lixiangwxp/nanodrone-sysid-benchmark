@@ -17,7 +17,11 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from dataset.dataset import QuadDataset, combine_concat_dataset
 from models.models import PhysQuadModel, PhysResQuadModel, ResidualQuadModel
-from models.models_lag import LagPhysResGRUModel, LagPhysResQuadModel
+from models.models_lag import (
+    LagPhysResGRUForceModel,
+    LagPhysResGRUModel,
+    LagPhysResQuadModel,
+)
 
 
 def parse_json_list(raw_value, arg_name):
@@ -30,7 +34,7 @@ def parse_json_list(raw_value, arg_name):
 
 
 def uses_lag(variant):
-    return variant in {"lag", "lag_gru", "lag_geo", "full"}
+    return variant in {"lag", "lag_gru", "lag_gru_force", "lag_geo", "full"}
 
 
 def find_latest_model(model_root):
@@ -76,10 +80,14 @@ def rebuild_model(checkpoint, x_scaler, u_scaler, device):
     phys_params = checkpoint["phys_params"]
     variant = config["variant"]
     hidden_dim = config.get("hidden_dim", 64)
+    gru_hidden_dim = config.get("gru_hidden_dim", 64)
     num_layers = config.get("num_layers", 5)
-    residual_input_dim = config.get(
-        "residual_input_dim", 12 if uses_lag(variant) else 4
-    )
+    default_residual_input_dim = 4
+    if variant in {"lag_gru", "lag_gru_force"}:
+        default_residual_input_dim = gru_hidden_dim + 12
+    elif uses_lag(variant):
+        default_residual_input_dim = 12
+    residual_input_dim = config.get("residual_input_dim", default_residual_input_dim)
     dt = config.get("dt", 0.01)
 
     phys_model = PhysQuadModel(phys_params, dt).to(device)
@@ -98,7 +106,17 @@ def rebuild_model(checkpoint, x_scaler, u_scaler, device):
             u_scaler=u_scaler,
             lag_mode=config.get("lag_mode", "per_motor"),
             alpha_init=config.get("alpha_init", 0.85),
-            hidden_dim=config.get("gru_hidden_dim", 64),
+            hidden_dim=gru_hidden_dim,
+        ).to(device)
+    elif variant == "lag_gru_force":
+        model = LagPhysResGRUForceModel(
+            phys=phys_model,
+            residual=residual_model,
+            x_scaler=x_scaler,
+            u_scaler=u_scaler,
+            lag_mode=config.get("lag_mode", "per_motor"),
+            alpha_init=config.get("alpha_init", 0.85),
+            hidden_dim=gru_hidden_dim,
         ).to(device)
     elif uses_lag(variant):
         model = LagPhysResQuadModel(

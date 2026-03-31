@@ -19,7 +19,11 @@ if str(PROJECT_ROOT) not in sys.path:
 from dataset.dataset import QuadDataset, combine_concat_dataset
 from dataset.dataset_aux import QuadDatasetWithAux, combine_concat_dataset_with_aux
 from models.models import PhysQuadModel, PhysResQuadModel, ResidualQuadModel
-from models.models_lag import LagPhysResGRUModel, LagPhysResQuadModel
+from models.models_lag import (
+    LagPhysResGRUForceModel,
+    LagPhysResGRUModel,
+    LagPhysResQuadModel,
+)
 from train.losses import WeightedMSELoss
 from train.losses_ext import CompositeAblationLoss
 from utils.seed_utils import build_torch_generator, seed_worker, set_global_seed
@@ -36,7 +40,9 @@ from utils.wandb_utils import (
 )
 
 
-VARIANT_CHOICES = ["baseline", "geo", "lag", "lag_gru", "lag_geo", "full"]
+VARIANT_CHOICES = ["baseline", "geo", "lag", "lag_gru", "lag_gru_force", "lag_geo", "full"]
+DEFAULT_AUX_COLS_RAW = '["az_body"]'
+DEFAULT_FORCE_AUX_COLS = ["ax_body", "ay_body", "az_body"]
 
 
 def parse_json_list(raw_value, arg_name):
@@ -49,7 +55,7 @@ def parse_json_list(raw_value, arg_name):
 
 
 def uses_lag(variant):
-    return variant in {"lag", "lag_gru", "lag_geo", "full"}
+    return variant in {"lag", "lag_gru", "lag_gru_force", "lag_geo", "full"}
 
 
 def uses_geo_loss(variant):
@@ -60,8 +66,16 @@ def uses_aux_supervision(variant):
     return variant == "full"
 
 
+def uses_force_supervision(variant):
+    return variant == "lag_gru_force"
+
+
+def uses_aux_dataset(variant):
+    return uses_aux_supervision(variant) or uses_force_supervision(variant)
+
+
 def uses_plain_temporal_loss(variant):
-    return variant in {"baseline", "lag", "lag_gru"}
+    return variant in {"baseline", "lag", "lag_gru", "lag_gru_force"}
 
 
 def build_model_name(variant, train_trajs):
@@ -126,7 +140,7 @@ def build_model(
     gru_hidden_dim,
 ):
     num_layers = 5
-    if variant == "lag_gru":
+    if variant in {"lag_gru", "lag_gru_force"}:
         residual_input_dim = gru_hidden_dim + 12
     elif uses_lag(variant):
         residual_input_dim = 12
@@ -143,6 +157,16 @@ def build_model(
 
     if variant == "lag_gru":
         model = LagPhysResGRUModel(
+            phys=phys_model,
+            residual=residual_model,
+            x_scaler=x_scaler,
+            u_scaler=u_scaler,
+            lag_mode=lag_mode,
+            alpha_init=alpha_init,
+            hidden_dim=gru_hidden_dim,
+        )
+    elif variant == "lag_gru_force":
+        model = LagPhysResGRUForceModel(
             phys=phys_model,
             residual=residual_model,
             x_scaler=x_scaler,
@@ -207,7 +231,7 @@ def compute_mixed_temporal_loss(pred_seq, x_seq):
     loss_exp = WeightedMSELoss(lambda_=0.03)(pred_seq, x_seq)
     loss_uniform = torch.mean((pred_seq - x_seq) ** 2)
     loss_tail = torch.mean((pred_seq[:, -10:] - x_seq[:, -10:]) ** 2)
-    total_loss = 0.5 * lsoss_exp + 0.3 * loss_uniform + 0.2 * loss_tail
+    total_loss = 0.5 * loss_exp + 0.3 * loss_uniform + 0.2 * loss_tail
 
     zero = total_loss.detach().new_tensor(0.0)
     loss_dict = {
@@ -222,7 +246,50 @@ def compute_mixed_temporal_loss(pred_seq, x_seq):
     return total_loss, loss_dict
 
 
+def maybe_compute_force_loss(model, batch, force_pred_seq, u_eff_seq_real, device, beta_force):
+    if len(batch) < 4:
+        zero = force_pred_seq.detach().new_tensor(0.0)
+        return zero, zero
+
+    aux_seq = batch[3].to(device)
+    if aux_seq.shape[-1] < 3:
+        zero = force_pred_seq.detach().new_tensor(0.0)
+        return zero, zero
+
+    f_meas_body = model.phys.m * aux_seq[..., :3]
+    thrust = model.phys.Kt * (u_eff_seq_real ** 2).sum(dim=-1, keepdim=True)
+    zeros = torch.zeros_like(thrust)
+    f_phys_body = torch.cat([zeros, zeros, thrust], dim=-1)
+    force_target_seq = f_meas_body - f_phys_body
+
+    force_loss = torch.nn.functional.smooth_l1_loss(force_pred_seq, force_target_seq)
+    weighted_force_loss = beta_force * force_loss
+    return weighted_force_loss, force_loss.detach()
+
+
 def compute_loss(model, criterion, batch, device, variant, loss_type):
+    if variant == "lag_gru_force":
+        x0, u_seq, x_seq = batch[:3]
+        x0 = x0.to(device)
+        u_seq = u_seq.to(device)
+        x_seq = x_seq.to(device)
+
+        pred_seq, force_pred_seq, u_eff_seq_real = model(x0, u_seq, return_force=True)
+        mixed_loss, loss_dict = compute_mixed_temporal_loss(pred_seq, x_seq)
+        weighted_force_loss, force_loss_value = maybe_compute_force_loss(
+            model=model,
+            batch=batch,
+            force_pred_seq=force_pred_seq,
+            u_eff_seq_real=u_eff_seq_real,
+            device=device,
+            beta_force=getattr(model, "beta_force", 0.0),
+        )
+        total_loss = mixed_loss + weighted_force_loss
+        loss_dict["loss_total"] = total_loss.detach()
+        loss_dict["loss_mse"] = mixed_loss.detach()
+        loss_dict["loss_force"] = force_loss_value
+        return total_loss, loss_dict
+
     use_aux = uses_aux_supervision(variant)
 
     if use_aux:
@@ -265,6 +332,49 @@ def update_metric_totals(metric_totals, loss_dict):
         metric_totals[key] += value.item()
 
 
+def build_optimizer(model, variant, base_lr):
+    weight_decay = 1e-5
+    if variant not in {"lag_gru", "lag_gru_force"}:
+        return optim.Adam(model.parameters(), lr=base_lr, weight_decay=weight_decay)
+
+    grouped_ids = set()
+
+    def collect_params(module):
+        params = []
+        if module is None:
+            return params
+        for param in module.parameters():
+            if not param.requires_grad or id(param) in grouped_ids:
+                continue
+            params.append(param)
+            grouped_ids.add(id(param))
+        return params
+
+    fast_params = collect_params(getattr(model, "u_init_head", None))
+    fast_params.extend(collect_params(getattr(model, "alpha_head", None)))
+
+    medium_params = collect_params(getattr(model, "gru_cell", None))
+    medium_params.extend(collect_params(getattr(model, "force_head", None)))
+    medium_params.extend(collect_params(getattr(model, "residual", None)))
+    medium_params.extend(collect_params(getattr(model, "h_init", None)))
+
+    slow_params = [
+        param
+        for param in model.parameters()
+        if param.requires_grad and id(param) not in grouped_ids
+    ]
+
+    param_groups = []
+    if fast_params:
+        param_groups.append({"params": fast_params, "lr": 3e-4, "weight_decay": weight_decay})
+    if medium_params:
+        param_groups.append({"params": medium_params, "lr": 1e-4, "weight_decay": weight_decay})
+    if slow_params:
+        param_groups.append({"params": slow_params, "lr": base_lr, "weight_decay": weight_decay})
+
+    return optim.Adam(param_groups, lr=base_lr, weight_decay=weight_decay)
+
+
 def build_checkpoint(
     model,
     optimizer,
@@ -284,6 +394,7 @@ def build_checkpoint(
     aux_dim,
     beta_geo,
     beta_aux,
+    beta_force,
     w_rot,
     w_omega,
     phys_params,
@@ -315,6 +426,7 @@ def build_checkpoint(
             "aux_dim": aux_dim,
             "beta_geo": beta_geo,
             "beta_aux": beta_aux,
+            "beta_force": beta_force,
             "w_rot": w_rot,
             "w_omega": w_omega,
             "residual_input_dim": residual_input_dim,
@@ -324,7 +436,7 @@ def build_checkpoint(
             "lr_start": lr_start,
             "lr_end": lr_end,
             "batch_size": batch_size,
-            "gru_hidden_dim": gru_hidden_dim if variant == "lag_gru" else None,
+            "gru_hidden_dim": gru_hidden_dim if variant in {"lag_gru", "lag_gru_force"} else None,
             "loss_type": loss_type,
         },
         "phys_params": phys_params,
@@ -392,11 +504,13 @@ def validate_resume_checkpoint(checkpoint, args, train_trajs, valid_trajs, aux_c
         expected_pairs.append(("loss_type", args.loss_type, config.get("loss_type")))
     if config.get("hidden_dim") is not None:
         expected_pairs.append(("hidden_dim", args.hidden_dim, config.get("hidden_dim")))
-    if args.variant == "lag_gru" and config.get("gru_hidden_dim") is not None:
+    if args.variant in {"lag_gru", "lag_gru_force"} and config.get("gru_hidden_dim") is not None:
         expected_pairs.append(("gru_hidden_dim", args.gru_hidden_dim, config.get("gru_hidden_dim")))
 
     if config.get("beta_geo") is not None:
         expected_pairs.append(("beta_geo", args.beta_geo, config.get("beta_geo")))
+    if config.get("beta_force") is not None:
+        expected_pairs.append(("beta_force", args.beta_force, config.get("beta_force")))
     if config.get("w_rot") is not None:
         expected_pairs.append(("w_rot", args.w_rot, config.get("w_rot")))
     if config.get("w_omega") is not None:
@@ -442,6 +556,7 @@ def main():
     parser.add_argument("--loss-type", type=str, default="exp", choices=["exp", "mixed"])
     parser.add_argument("--beta_geo", type=float, default=0.01)
     parser.add_argument("--beta_aux", type=float, default=0.05)
+    parser.add_argument("--beta-force", type=float, default=0.1)
     parser.add_argument("--w_rot", type=float, default=2.0)
     parser.add_argument("--w_omega", type=float, default=2.0)
     parser.add_argument("--lag_mode", type=str, default="per_motor", choices=["shared", "per_motor"])
@@ -466,8 +581,19 @@ def main():
     add_wandb_args(parser)
     args = parser.parse_args()
 
+    if uses_force_supervision(args.variant) and args.loss_type != "mixed":
+        print("⚠️ lag_gru_force uses mixed temporal loss. Overriding --loss-type to 'mixed'.")
+        args.loss_type = "mixed"
+
     train_trajs = parse_json_list(args.train_trajs, "train_trajs")
     aux_cols = parse_json_list(args.aux_cols, "aux_cols")
+    if uses_force_supervision(args.variant) and args.aux_cols == DEFAULT_AUX_COLS_RAW:
+        aux_cols = DEFAULT_FORCE_AUX_COLS
+    if uses_force_supervision(args.variant) and len(aux_cols) < 3:
+        print(
+            "⚠️ lag_gru_force expects 3 auxiliary body-acceleration channels. "
+            "Force loss will be skipped unless aux_cols provides at least 3 values."
+        )
     train_runs = [1, 2, 3]
     valid_runs = [4]
     valid_trajs = train_trajs
@@ -518,25 +644,54 @@ def main():
 
     data_dir = PROJECT_ROOT / "data" / "train"
     use_aux = uses_aux_supervision(args.variant)
+    use_aux_data = uses_aux_dataset(args.variant)
+    force_aux_available = uses_force_supervision(args.variant)
 
-    train_ds = load_split(
-        train_trajs,
-        train_runs,
-        data_dir,
-        "train",
-        args.horizon,
-        use_aux=use_aux,
-        aux_cols=aux_cols,
-    )
-    valid_ds = load_split(
-        valid_trajs,
-        valid_runs,
-        data_dir,
-        "valid",
-        args.horizon,
-        use_aux=use_aux,
-        aux_cols=aux_cols,
-    )
+    try:
+        train_ds = load_split(
+            train_trajs,
+            train_runs,
+            data_dir,
+            "train",
+            args.horizon,
+            use_aux=use_aux_data,
+            aux_cols=aux_cols,
+        )
+        valid_ds = load_split(
+            valid_trajs,
+            valid_runs,
+            data_dir,
+            "valid",
+            args.horizon,
+            use_aux=use_aux_data,
+            aux_cols=aux_cols,
+        )
+    except Exception as exc:
+        if not uses_force_supervision(args.variant):
+            raise
+        print(
+            "⚠️ Force auxiliary labels are unavailable. "
+            f"Continuing without force supervision: {exc}"
+        )
+        force_aux_available = False
+        train_ds = load_split(
+            train_trajs,
+            train_runs,
+            data_dir,
+            "train",
+            args.horizon,
+            use_aux=False,
+            aux_cols=aux_cols,
+        )
+        valid_ds = load_split(
+            valid_trajs,
+            valid_runs,
+            data_dir,
+            "valid",
+            args.horizon,
+            use_aux=False,
+            aux_cols=aux_cols,
+        )
 
     if use_aux:
         train_dataset = combine_concat_dataset_with_aux(
@@ -547,6 +702,28 @@ def main():
         )
         resolved_aux_cols = getattr(train_ds[0], "aux_cols", aux_cols)
         aux_dim = train_dataset.aux_seq.shape[-1]
+    elif force_aux_available:
+        train_dataset = combine_concat_dataset_with_aux(
+            ConcatDataset(train_ds),
+            scale=True,
+            fold="train",
+            scaler_dir=scaler_dir,
+            scale_aux=False,
+        )
+        valid_dataset = combine_concat_dataset_with_aux(
+            ConcatDataset(valid_ds),
+            scale=True,
+            fold="valid",
+            scaler_dir=scaler_dir,
+            scale_aux=False,
+        )
+        resolved_aux_cols = getattr(train_ds[0], "aux_cols", aux_cols)
+        aux_dim = train_dataset.aux_seq.shape[-1]
+        if aux_dim < 3:
+            print(
+                "⚠️ Force auxiliary supervision is active but aux_dim < 3. "
+                "Residual force loss will stay disabled."
+            )
     else:
         train_dataset = combine_concat_dataset(
             ConcatDataset(train_ds), scale=True, fold="train", scaler_dir=scaler_dir
@@ -598,6 +775,7 @@ def main():
         gru_hidden_dim=args.gru_hidden_dim,
     )
     model = model.to(device)
+    model.beta_force = args.beta_force
     print(f"🧩 Initialized model variant: {args.variant}")
     num_trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Total trainable parameters: {num_trainable_params:,}")
@@ -613,7 +791,7 @@ def main():
     if criterion is not None:
         criterion = criterion.to(device)
 
-    optimizer = optim.Adam(model.parameters(), lr=lr_start)
+    optimizer = build_optimizer(model, args.variant, lr_start)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=args.epochs, eta_min=lr_end
     )
@@ -634,6 +812,7 @@ def main():
             "dt": dt,
             "device": str(device),
             "use_aux": use_aux,
+            "force_aux_available": force_aux_available,
             "resolved_aux_cols": resolved_aux_cols,
             "aux_dim": aux_dim,
             "hidden_dim": hidden_dim,
@@ -731,6 +910,7 @@ def main():
                 args.loss_type,
             )
             total_loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             grad_norm = compute_gradient_norm(model)
             train_grad_norm_total += grad_norm
             train_grad_norm_max = max(train_grad_norm_max, grad_norm)
@@ -780,6 +960,11 @@ def main():
                 f" | TrainTail={avg_train_metrics['loss_tail']:.6f}"
                 f" | ValidTail={avg_valid_metrics['loss_tail']:.6f}"
             )
+        if "loss_force" in avg_train_metrics:
+            log_msg += (
+                f" | TrainForce={avg_train_metrics['loss_force']:.6f}"
+                f" | ValidForce={avg_valid_metrics['loss_force']:.6f}"
+            )
         print(log_msg)
 
         if is_best:
@@ -807,6 +992,7 @@ def main():
             aux_dim=aux_dim,
             beta_geo=args.beta_geo,
             beta_aux=args.beta_aux,
+            beta_force=args.beta_force,
             w_rot=args.w_rot,
             w_omega=args.w_omega,
             phys_params=phys_params,

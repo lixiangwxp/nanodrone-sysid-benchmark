@@ -287,7 +287,7 @@ class LagPhysResGRUModel(LagPhysResQuadModel):
             dim=-1,
         )
 
-    def forward(self, x0, u_seq):
+    def forward(self, x0, u_seq, return_force=False):
         if u_seq.ndim == 2:
             u_seq = u_seq.unsqueeze(1)
         if x0.ndim == 3:
@@ -339,4 +339,126 @@ class LagPhysResGRUModel(LagPhysResQuadModel):
         return torch.cat(preds, dim=1)
 
 
-__all__ = ["MotorLagLayer", "LagPhysResQuadModel", "LagPhysResGRUModel"]
+class LagPhysResGRUForceModel(LagPhysResGRUModel):
+    """GRU-conditioned lag model with learned initial lag state and residual force."""
+
+    def __init__(
+        self,
+        phys,
+        residual,
+        x_scaler,
+        u_scaler,
+        lag_mode="per_motor",
+        alpha_init=0.85,
+        hidden_dim=64,
+    ):
+        super().__init__(
+            phys=phys,
+            residual=residual,
+            x_scaler=x_scaler,
+            u_scaler=u_scaler,
+            lag_mode=lag_mode,
+            alpha_init=alpha_init,
+            hidden_dim=hidden_dim,
+        )
+
+        state_dim = residual.out.out_features
+        control_dim = 4
+        self.u_init_head = nn.Sequential(
+            nn.Linear(state_dim + control_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, control_dim),
+        )
+        self.force_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 3),
+        )
+
+        nn.init.zeros_(self.u_init_head[-1].weight)
+        nn.init.zeros_(self.u_init_head[-1].bias)
+        nn.init.zeros_(self.force_head[-1].weight)
+        nn.init.zeros_(self.force_head[-1].bias)
+
+    def forward(self, x0, u_seq):
+        if u_seq.ndim == 2:
+            u_seq = u_seq.unsqueeze(1)
+        if x0.ndim == 3:
+            x_norm = x0.squeeze(1)
+        else:
+            x_norm = x0
+
+        if x_norm.ndim != 2:
+            raise ValueError("x0 must have shape (B,12) or (B,1,12)")
+        if u_seq.ndim != 3 or u_seq.shape[-1] != 4:
+            raise ValueError("u_seq must have shape (B,T,4) or (B,4)")
+
+        _, horizon, _ = u_seq.shape
+        preds = []
+        force_preds = []
+        u_eff_seq = []
+        h = self.h_init(x_norm)
+
+        u0_norm = u_seq[:, 0, :]
+        u0_real = self.u_denorm(u0_norm)
+        delta_u0 = self.u_init_head(torch.cat([x_norm, u0_norm], dim=-1))
+        u_eff_prev_real = u0_real + delta_u0
+
+        for t in range(horizon):
+            u_raw_norm = u_seq[:, t, :]
+            u_raw_real = self.u_denorm(u_raw_norm)
+
+            u_eff_seed_real = self.lag_layer(u_eff_prev_real, u_raw_real)
+            u_eff_seed_norm = self.u_normed(u_eff_seed_real)
+            alpha_in = self._pack_gru_features(x_norm, u_raw_norm, u_eff_seed_norm, h)
+            alpha_t = torch.sigmoid(self.alpha_head(alpha_in))
+
+            u_eff_real = alpha_t * u_eff_prev_real + (1.0 - alpha_t) * u_raw_real
+            u_eff_norm = self.u_normed(u_eff_real)
+
+            x_real = self.x_denorm(x_norm)
+            with torch.no_grad():
+                x_phys_next_real = self.physics_step_from_motors(x_real, u_eff_real)
+
+            gru_in = self._pack_gru_features(x_norm, u_raw_norm, u_eff_norm, h)
+            h = self.gru_cell(gru_in, h)
+
+            delta_f_b = self.force_head(h)
+            x_force_next_real = self.phys.apply_force(
+                x_real,
+                u_eff_real,
+                delta_f_b,
+                x_phys_next_real=x_phys_next_real,
+            )
+
+            residual_in = self._pack_gru_features(x_norm, u_raw_norm, u_eff_norm, h)
+            dx_res_norm = self.residual.out(self.residual.mlp(residual_in))
+            dx_res_real = dx_res_norm * self.x_scale
+            x_next_real = x_force_next_real + dx_res_real
+            x_force_next_norm = self.x_normed(x_force_next_real)
+            x_next_norm = self.x_normed(x_next_real)
+
+            finite_mask = torch.isfinite(x_next_norm).all(dim=-1, keepdim=True)
+            x_next_norm = torch.where(finite_mask, x_next_norm, x_force_next_norm)
+
+            preds.append(x_next_norm.unsqueeze(1))
+            force_preds.append(delta_f_b.unsqueeze(1))
+            u_eff_seq.append(u_eff_real.unsqueeze(1))
+            x_norm = x_next_norm
+            u_eff_prev_real = u_eff_real
+
+        pred_seq = torch.cat(preds, dim=1)
+        if not return_force:
+            return pred_seq
+
+        force_pred_seq = torch.cat(force_preds, dim=1)
+        u_eff_seq_real = torch.cat(u_eff_seq, dim=1)
+        return pred_seq, force_pred_seq, u_eff_seq_real
+
+
+__all__ = [
+    "MotorLagLayer",
+    "LagPhysResQuadModel",
+    "LagPhysResGRUModel",
+    "LagPhysResGRUForceModel",
+]

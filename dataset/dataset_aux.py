@@ -111,6 +111,7 @@ def combine_concat_dataset_with_aux(
     scale=False,
     fold="train",
     scaler_dir="./scalers",
+    scale_aux=True,
 ):
     """
     Combine multiple aux-aware datasets into one dataset with optional scaling.
@@ -157,7 +158,7 @@ def combine_concat_dataset_with_aux(
 
             x_scaler = StandardScaler()
             u_scaler = StandardScaler()
-            aux_scaler = StandardScaler()
+            aux_scaler = StandardScaler() if scale_aux else None
 
             x_flat = np.concatenate(
                 [
@@ -171,15 +172,17 @@ def combine_concat_dataset_with_aux(
 
             x_scaler.fit(x_flat)
             u_scaler.fit(u_flat)
-            aux_scaler.fit(aux_flat)
+            if scale_aux:
+                aux_scaler.fit(aux_flat)
 
             joblib.dump(x_scaler, x_scaler_path)
             joblib.dump(u_scaler, u_scaler_path)
-            joblib.dump(aux_scaler, aux_scaler_path)
+            if scale_aux:
+                joblib.dump(aux_scaler, aux_scaler_path)
         else:
             x_scaler = joblib.load(x_scaler_path)
             u_scaler = joblib.load(u_scaler_path)
-            aux_scaler = joblib.load(aux_scaler_path)
+            aux_scaler = joblib.load(aux_scaler_path) if scale_aux else None
 
         final_xs = torch.from_numpy(
             x_scaler.transform(final_xs.reshape(-1, final_xs.shape[-1]).numpy())
@@ -190,9 +193,10 @@ def combine_concat_dataset_with_aux(
         final_xs_seq = torch.from_numpy(
             x_scaler.transform(final_xs_seq.reshape(-1, final_xs_seq.shape[-1]).numpy())
         ).float().reshape_as(final_xs_seq)
-        final_aux_seq = torch.from_numpy(
-            aux_scaler.transform(final_aux_seq.reshape(-1, final_aux_seq.shape[-1]).numpy())
-        ).float().reshape_as(final_aux_seq)
+        if scale_aux:
+            final_aux_seq = torch.from_numpy(
+                aux_scaler.transform(final_aux_seq.reshape(-1, final_aux_seq.shape[-1]).numpy())
+            ).float().reshape_as(final_aux_seq)
     else:
         x_scaler = None
         u_scaler = None
