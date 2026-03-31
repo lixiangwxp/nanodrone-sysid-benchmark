@@ -19,7 +19,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from dataset.dataset import QuadDataset, combine_concat_dataset
 from dataset.dataset_aux import QuadDatasetWithAux, combine_concat_dataset_with_aux
 from models.models import PhysQuadModel, PhysResQuadModel, ResidualQuadModel
-from models.models_lag import LagPhysResQuadModel
+from models.models_lag import LagPhysResGRUModel, LagPhysResQuadModel
 from train.losses import WeightedMSELoss
 from train.losses_ext import CompositeAblationLoss
 from utils.seed_utils import build_torch_generator, seed_worker, set_global_seed
@@ -36,7 +36,7 @@ from utils.wandb_utils import (
 )
 
 
-VARIANT_CHOICES = ["baseline", "geo", "lag", "lag_geo", "full"]
+VARIANT_CHOICES = ["baseline", "geo", "lag", "lag_gru", "lag_geo", "full"]
 
 
 def parse_json_list(raw_value, arg_name):
@@ -49,7 +49,7 @@ def parse_json_list(raw_value, arg_name):
 
 
 def uses_lag(variant):
-    return variant in {"lag", "lag_geo", "full"}
+    return variant in {"lag", "lag_gru", "lag_geo", "full"}
 
 
 def uses_geo_loss(variant):
@@ -61,7 +61,7 @@ def uses_aux_supervision(variant):
 
 
 def uses_plain_temporal_loss(variant):
-    return variant in {"baseline", "lag"}
+    return variant in {"baseline", "lag", "lag_gru"}
 
 
 def build_model_name(variant, train_trajs):
@@ -113,10 +113,25 @@ def load_split(trajs, runs, data_dir, split, horizon, use_aux=False, aux_cols=No
     return datasets
 
 
-def build_model(variant, phys_params, dt, x_scaler, u_scaler, lag_mode, alpha_init, aux_dim):
-    hidden_dim = 64
+def build_model(
+    variant,
+    phys_params,
+    dt,
+    x_scaler,
+    u_scaler,
+    lag_mode,
+    alpha_init,
+    aux_dim,
+    hidden_dim,
+    gru_hidden_dim,
+):
     num_layers = 5
-    residual_input_dim = 12 if uses_lag(variant) else 4
+    if variant == "lag_gru":
+        residual_input_dim = gru_hidden_dim + 8
+    elif uses_lag(variant):
+        residual_input_dim = 12
+    else:
+        residual_input_dim = 4
 
     phys_model = PhysQuadModel(phys_params, dt)
     residual_model = ResidualQuadModel(
@@ -126,7 +141,17 @@ def build_model(variant, phys_params, dt, x_scaler, u_scaler, lag_mode, alpha_in
         dt=dt,
     )
 
-    if uses_lag(variant):
+    if variant == "lag_gru":
+        model = LagPhysResGRUModel(
+            phys=phys_model,
+            residual=residual_model,
+            x_scaler=x_scaler,
+            u_scaler=u_scaler,
+            lag_mode=lag_mode,
+            alpha_init=alpha_init,
+            hidden_dim=gru_hidden_dim,
+        )
+    elif uses_lag(variant):
         model = LagPhysResQuadModel(
             phys=phys_model,
             residual=residual_model,
@@ -268,6 +293,7 @@ def build_checkpoint(
     lr_start,
     lr_end,
     batch_size,
+    gru_hidden_dim,
     loss_type,
     scaler_dir,
     train_trajs,
@@ -298,6 +324,7 @@ def build_checkpoint(
             "lr_start": lr_start,
             "lr_end": lr_end,
             "batch_size": batch_size,
+            "gru_hidden_dim": gru_hidden_dim if variant == "lag_gru" else None,
             "loss_type": loss_type,
         },
         "phys_params": phys_params,
@@ -363,6 +390,10 @@ def validate_resume_checkpoint(checkpoint, args, train_trajs, valid_trajs, aux_c
 
     if config.get("loss_type") is not None:
         expected_pairs.append(("loss_type", args.loss_type, config.get("loss_type")))
+    if config.get("hidden_dim") is not None:
+        expected_pairs.append(("hidden_dim", args.hidden_dim, config.get("hidden_dim")))
+    if args.variant == "lag_gru" and config.get("gru_hidden_dim") is not None:
+        expected_pairs.append(("gru_hidden_dim", args.gru_hidden_dim, config.get("gru_hidden_dim")))
 
     if config.get("beta_geo") is not None:
         expected_pairs.append(("beta_geo", args.beta_geo, config.get("beta_geo")))
@@ -406,6 +437,8 @@ def main():
     parser.add_argument("--epochs", type=int, default=500)
     parser.add_argument("--horizon", type=int, default=50)
     parser.add_argument("--variant", type=str, default="baseline", choices=VARIANT_CHOICES)
+    parser.add_argument("--hidden-dim", type=int, default=64)
+    parser.add_argument("--gru-hidden-dim", type=int, default=64)
     parser.add_argument("--loss-type", type=str, default="exp", choices=["exp", "mixed"])
     parser.add_argument("--beta_geo", type=float, default=0.01)
     parser.add_argument("--beta_aux", type=float, default=0.05)
@@ -561,6 +594,8 @@ def main():
         lag_mode=args.lag_mode,
         alpha_init=args.alpha_init,
         aux_dim=aux_dim,
+        hidden_dim=args.hidden_dim,
+        gru_hidden_dim=args.gru_hidden_dim,
     )
     model = model.to(device)
     print(f"🧩 Initialized model variant: {args.variant}")
@@ -781,6 +816,7 @@ def main():
             lr_start=lr_start,
             lr_end=lr_end,
             batch_size=batch_size,
+            gru_hidden_dim=args.gru_hidden_dim,
             loss_type=args.loss_type,
             scaler_dir=scaler_dir,
             train_trajs=train_trajs,

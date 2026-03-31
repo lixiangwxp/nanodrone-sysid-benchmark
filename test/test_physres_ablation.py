@@ -17,7 +17,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from dataset.dataset import QuadDataset, combine_concat_dataset
 from models.models import PhysQuadModel, PhysResQuadModel, ResidualQuadModel
-from models.models_lag import LagPhysResQuadModel
+from models.models_lag import LagPhysResGRUModel, LagPhysResQuadModel
 
 
 def parse_json_list(raw_value, arg_name):
@@ -30,7 +30,7 @@ def parse_json_list(raw_value, arg_name):
 
 
 def uses_lag(variant):
-    return variant in {"lag", "lag_geo", "full"}
+    return variant in {"lag", "lag_gru", "lag_geo", "full"}
 
 
 def find_latest_model(model_root):
@@ -90,7 +90,17 @@ def rebuild_model(checkpoint, x_scaler, u_scaler, device):
         dt=dt,
     ).to(device)
 
-    if uses_lag(variant):
+    if variant == "lag_gru":
+        model = LagPhysResGRUModel(
+            phys=phys_model,
+            residual=residual_model,
+            x_scaler=x_scaler,
+            u_scaler=u_scaler,
+            lag_mode=config.get("lag_mode", "per_motor"),
+            alpha_init=config.get("alpha_init", 0.85),
+            hidden_dim=config.get("gru_hidden_dim", 64),
+        ).to(device)
+    elif uses_lag(variant):
         model = LagPhysResQuadModel(
             phys=phys_model,
             residual=residual_model,
