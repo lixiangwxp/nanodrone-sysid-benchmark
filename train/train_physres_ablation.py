@@ -207,7 +207,7 @@ def compute_mixed_temporal_loss(pred_seq, x_seq):
     loss_exp = WeightedMSELoss(lambda_=0.03)(pred_seq, x_seq)
     loss_uniform = torch.mean((pred_seq - x_seq) ** 2)
     loss_tail = torch.mean((pred_seq[:, -10:] - x_seq[:, -10:]) ** 2)
-    total_loss = 0.5 * loss_exp + 0.3 * loss_uniform + 0.2 * loss_tail
+    total_loss = 0.5 * lsoss_exp + 0.3 * loss_uniform + 0.2 * loss_tail
 
     zero = total_loss.detach().new_tensor(0.0)
     loss_dict = {

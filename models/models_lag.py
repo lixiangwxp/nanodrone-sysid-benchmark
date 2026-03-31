@@ -258,8 +258,11 @@ class LagPhysResGRUModel(LagPhysResQuadModel):
 
         state_dim = residual.out.out_features
         control_dim = 4
-        feature_dim = state_dim + control_dim + control_dim + hidden_dim
-        self._validate_residual_input(state_dim=state_dim, control_feat_dim=control_dim + control_dim + hidden_dim)
+        feature_dim = state_dim + 3 * control_dim + hidden_dim
+        self._validate_residual_input(
+            state_dim=state_dim,
+            control_feat_dim=3 * control_dim + hidden_dim,
+        )
 
         x_mean, x_scale = self._scaler_to_tensors(x_scaler, state_dim)
         u_mean, u_scale = self._scaler_to_tensors(u_scaler, control_dim)
@@ -279,7 +282,10 @@ class LagPhysResGRUModel(LagPhysResQuadModel):
 
     @staticmethod
     def _pack_gru_features(x_norm, u_raw_norm, u_eff_norm, h):
-        return torch.cat([x_norm, u_raw_norm, u_eff_norm, h], dim=-1)
+        return torch.cat(
+            [x_norm, u_raw_norm, u_eff_norm, u_raw_norm - u_eff_norm, h],
+            dim=-1,
+        )
 
     def forward(self, x0, u_seq):
         if u_seq.ndim == 2:
