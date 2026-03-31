@@ -127,7 +127,7 @@ def build_model(
 ):
     num_layers = 5
     if variant == "lag_gru":
-        residual_input_dim = gru_hidden_dim + 8
+        residual_input_dim = gru_hidden_dim + 12
     elif uses_lag(variant):
         residual_input_dim = 12
     else:

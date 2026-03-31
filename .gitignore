@@ -8,6 +8,7 @@ __pycache__/
 
 # Large / reproducible run artifacts
 out/models/
+out/models_smoke/
 out/predictions/
 out/export/
 out/benchmark_summary.csv
