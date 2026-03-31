@@ -4,8 +4,15 @@ import numpy as np
 import torch
 
 
-def set_global_seed(seed: int, deterministic: bool = True) -> None:
-    """Seed Python, NumPy, and PyTorch for more reproducible training."""
+def set_global_seed(seed: int, deterministic: bool = False) -> None:
+    """Seed Python, NumPy, and PyTorch.
+
+    ``deterministic=False`` (default): faster cuDNN autotune and non-deterministic
+    CUDA kernels; fixed input shapes in training benefit from ``benchmark=True``.
+
+    ``deterministic=True``: stricter reproducibility at the cost of speed (cuBLAS
+    workspace hints may still be required for full bitwise parity).
+    """
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -18,6 +25,10 @@ def set_global_seed(seed: int, deterministic: bool = True) -> None:
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
         torch.use_deterministic_algorithms(True, warn_only=True)
+    else:
+        torch.backends.cudnn.deterministic = False
+        torch.backends.cudnn.benchmark = True
+        torch.use_deterministic_algorithms(False)
 
 
 def build_torch_generator(seed: int) -> torch.Generator:

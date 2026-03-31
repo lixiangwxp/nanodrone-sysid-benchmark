@@ -68,7 +68,7 @@ class WeightedMSELoss(nn.Module):
 # SO(3) exponential + logarithm maps
 # --------------------------------------------------
 
-def clamp_rotvec(phi, max_angle=math.pi - 1e-3, eps=1e-8):
+def clamp_rotvec(phi, max_angle=math.inf, eps=1e-8):
     """
     Clamp rotation vectors so that ||phi|| <= max_angle.
     This prevents the network from producing insane angles that
@@ -161,7 +161,7 @@ class WeightedGeodesicLoss(nn.Module):
     state = [p (3), v (3), r_log (3), omega (3)]
     """
 
-    def __init__(self, lambda_=0.05, w_pos=1.0, w_vel=0.1, w_omega=10.0, w_rot=10.0):
+    def __init__(self, lambda_=0.05, w_pos=1.0, w_vel=0.1, w_omega=2.0, w_rot=2.0):
         super().__init__()
         self.lambda_ = lambda_
         self.w_pos = w_pos
@@ -176,7 +176,7 @@ class WeightedGeodesicLoss(nn.Module):
 
         # --- Exponential weights over horizon ---
         weights = torch.exp(-self.lambda_ * torch.arange(N, device=pred.device))
-        # weights = weights / weights.sum()            # (N,)
+        weights = weights / weights.sum()
         W = weights.view(1, N, 1)                    # (1,N,1)
 
         # --- Split components ---
@@ -238,4 +238,3 @@ class WeightedGeodesicLoss(nn.Module):
         #     raise RuntimeError("NaN in WeightedGeodesicLoss")
 
         return total
-

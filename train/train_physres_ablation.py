@@ -2,6 +2,7 @@ import argparse
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 import pandas as pd
@@ -22,6 +23,17 @@ from models.models_lag import LagPhysResQuadModel
 from train.losses import WeightedMSELoss
 from train.losses_ext import CompositeAblationLoss
 from utils.seed_utils import build_torch_generator, seed_worker, set_global_seed
+from utils.wandb_utils import (
+    add_wandb_args,
+    collect_lag_metrics,
+    compute_gradient_norm,
+    compute_parameter_norm,
+    finish_run,
+    init_wandb_run,
+    log_metrics,
+    maybe_watch_model,
+    prefix_metrics,
+)
 
 
 VARIANT_CHOICES = ["baseline", "geo", "lag", "lag_geo", "full"]
@@ -46,6 +58,10 @@ def uses_geo_loss(variant):
 
 def uses_aux_supervision(variant):
     return variant == "full"
+
+
+def build_model_name(variant, train_trajs):
+    return f"physres_ablation__{variant}__{'_'.join(train_trajs)}"
 
 
 def build_phys_params():
@@ -128,7 +144,7 @@ def build_model(variant, phys_params, dt, x_scaler, u_scaler, lag_mode, alpha_in
     return model, hidden_dim, num_layers, residual_input_dim
 
 
-def build_criterion(variant, x_scaler, beta_geo, beta_aux):
+def build_criterion(variant, x_scaler, beta_geo, beta_aux, w_rot, w_omega):
     if variant in {"baseline", "lag"}:
         return WeightedMSELoss(lambda_=0.1)
 
@@ -140,6 +156,8 @@ def build_criterion(variant, x_scaler, beta_geo, beta_aux):
         use_aux=uses_aux_supervision(variant),
         beta_aux=beta_aux,
         aux_loss_type="smooth_l1",
+        w_rot=w_rot,
+        w_omega=w_omega,
     )
 
 
@@ -198,9 +216,12 @@ def update_metric_totals(metric_totals, loss_dict):
 def build_checkpoint(
     model,
     optimizer,
+    scheduler,
     epoch,
     train_metrics,
     val_metrics,
+    best_val_loss,
+    best_epoch,
     variant,
     hidden_dim,
     num_layers,
@@ -209,9 +230,17 @@ def build_checkpoint(
     alpha_init,
     aux_cols,
     aux_dim,
+    beta_geo,
+    beta_aux,
+    w_rot,
+    w_omega,
     phys_params,
     dt,
     horizon,
+    total_epochs,
+    lr_start,
+    lr_end,
+    batch_size,
     scaler_dir,
     train_trajs,
     valid_trajs,
@@ -230,13 +259,25 @@ def build_checkpoint(
             "alpha_init": alpha_init,
             "aux_cols": aux_cols,
             "aux_dim": aux_dim,
+            "beta_geo": beta_geo,
+            "beta_aux": beta_aux,
+            "w_rot": w_rot,
+            "w_omega": w_omega,
             "residual_input_dim": residual_input_dim,
             "dt": dt,
             "horizon": horizon,
+            "total_epochs": total_epochs,
+            "lr_start": lr_start,
+            "lr_end": lr_end,
+            "batch_size": batch_size,
         },
         "phys_params": phys_params,
         "optimizer_state": optimizer.state_dict(),
+        "scheduler_state": scheduler.state_dict(),
         "epoch": epoch,
+        "completed_epoch": epoch + 1,
+        "best_val_loss": best_val_loss,
+        "best_epoch": best_epoch,
         "train_loss": train_metrics["loss_total"],
         "val_loss": val_metrics["loss_total"],
         "train_metrics": train_metrics,
@@ -244,9 +285,86 @@ def build_checkpoint(
         "train_trajs": train_trajs,
         "valid_trajs": valid_trajs,
         "seed": seed,
-        "model_name": f"physres_ablation__{variant}__{'_'.join(train_trajs)}",
+        "model_name": build_model_name(variant, train_trajs),
         "scaler_dir": str(scaler_dir),
     }
+
+
+def atomic_torch_save(payload, path):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f"{path.name}.tmp")
+    torch.save(payload, tmp_path)
+    tmp_path.replace(path)
+
+
+def move_optimizer_state_to_device(optimizer, device):
+    for state in optimizer.state.values():
+        for key, value in state.items():
+            if isinstance(value, torch.Tensor):
+                state[key] = value.to(device)
+
+
+def resolve_checkpoint_path(raw_path, model_dir, model_name):
+    if raw_path is None:
+        return None
+    if raw_path == "latest":
+        return model_dir / f"{model_name}__latest.pt"
+    if raw_path == "best":
+        return model_dir / f"{model_name}.pt"
+    return Path(raw_path).expanduser()
+
+
+def validate_resume_checkpoint(checkpoint, args, train_trajs, valid_trajs, aux_cols):
+    if "model_state" not in checkpoint:
+        raise KeyError("Resume checkpoint is missing 'model_state'")
+    if "config" not in checkpoint:
+        raise KeyError("Resume checkpoint is missing 'config'")
+
+    config = checkpoint["config"]
+    mismatches = []
+
+    expected_pairs = [
+        ("variant", args.variant, config.get("variant")),
+        ("horizon", args.horizon, config.get("horizon")),
+        ("epochs", args.epochs, config.get("total_epochs")),
+        ("train_trajs", train_trajs, checkpoint.get("train_trajs")),
+        ("valid_trajs", valid_trajs, checkpoint.get("valid_trajs")),
+    ]
+
+    if config.get("beta_geo") is not None:
+        expected_pairs.append(("beta_geo", args.beta_geo, config.get("beta_geo")))
+    if config.get("w_rot") is not None:
+        expected_pairs.append(("w_rot", args.w_rot, config.get("w_rot")))
+    if config.get("w_omega") is not None:
+        expected_pairs.append(("w_omega", args.w_omega, config.get("w_omega")))
+
+    if uses_aux_supervision(args.variant):
+        if config.get("beta_aux") is not None:
+            expected_pairs.append(("beta_aux", args.beta_aux, config.get("beta_aux")))
+        if config.get("aux_cols") is not None:
+            expected_pairs.append(("aux_cols", aux_cols, config.get("aux_cols")))
+
+    if uses_lag(args.variant):
+        expected_pairs.append(("lag_mode", args.lag_mode, config.get("lag_mode")))
+        if config.get("alpha_init") is not None:
+            expected_pairs.append(("alpha_init", args.alpha_init, config.get("alpha_init")))
+
+    for name, current_value, saved_value in expected_pairs:
+        if saved_value is None:
+            continue
+        if current_value != saved_value:
+            mismatches.append(
+                f"{name}: current={current_value!r}, checkpoint={saved_value!r}"
+            )
+
+    if mismatches:
+        mismatch_text = "\n".join(f"  - {item}" for item in mismatches)
+        raise ValueError(
+            "Resume checkpoint does not match the current training configuration:\n"
+            f"{mismatch_text}\n"
+            "Please resume with the same arguments that created the checkpoint."
+        )
 
 
 def main():
@@ -256,14 +374,29 @@ def main():
     parser.add_argument("--epochs", type=int, default=500)
     parser.add_argument("--horizon", type=int, default=50)
     parser.add_argument("--variant", type=str, default="baseline", choices=VARIANT_CHOICES)
-    parser.add_argument("--beta_geo", type=float, default=0.1)
+    parser.add_argument("--beta_geo", type=float, default=0.01)
     parser.add_argument("--beta_aux", type=float, default=0.05)
+    parser.add_argument("--w_rot", type=float, default=2.0)
+    parser.add_argument("--w_omega", type=float, default=2.0)
     parser.add_argument("--lag_mode", type=str, default="per_motor", choices=["shared", "per_motor"])
     parser.add_argument("--alpha_init", type=float, default=0.85)
     parser.add_argument("--aux_cols", type=str, default='["az_body"]')
     parser.add_argument("--save_every", type=int, default=0)
+    parser.add_argument("--save_latest_every", type=int, default=1)
+    parser.add_argument(
+        "--resume_path",
+        type=str,
+        default=None,
+        help="Checkpoint path to resume from, or 'latest'/'best' for this run.",
+    )
     parser.add_argument("--out_model_dir", type=str, default=str(PROJECT_ROOT / "out" / "models"))
     parser.add_argument("--scaler_root", type=str, default=str(PROJECT_ROOT / "scalers"))
+    parser.add_argument(
+        "--deterministic",
+        action="store_true",
+        help="Slower, stricter GPU reproducibility (cuDNN deterministic, no autotune).",
+    )
+    add_wandb_args(parser)
     args = parser.parse_args()
 
     train_trajs = parse_json_list(args.train_trajs, "train_trajs")
@@ -282,19 +415,38 @@ def main():
         os.environ["CUDA_VISIBLE_DEVICES"] = device_str.split(":")[-1]
     device = torch.device(device_str if torch.cuda.is_available() else "cpu")
 
-    set_global_seed(seed)
-    print(f"🌱 Global seed set to: {seed}")
+    set_global_seed(seed, deterministic=args.deterministic)
+    print(f"🌱 Global seed set to: {seed} (deterministic={args.deterministic})")
 
-    model_name = f"physres_ablation__{args.variant}__{'_'.join(train_trajs)}"
+    model_name = build_model_name(args.variant, train_trajs)
     print(f"🧠 Model name composed automatically: {model_name}")
 
     model_dir = Path(args.out_model_dir)
     model_dir.mkdir(parents=True, exist_ok=True)
     model_path = model_dir / f"{model_name}.pt"
+    latest_path = model_dir / f"{model_name}__latest.pt"
     print(f"✅ Model will be saved to: {model_path}")
 
+    resume_checkpoint = None
+    resume_path = resolve_checkpoint_path(args.resume_path, model_dir, model_name)
+    if resume_path is not None:
+        if not resume_path.exists():
+            raise FileNotFoundError(f"❌ Resume checkpoint not found: {resume_path}")
+        resume_checkpoint = torch.load(resume_path, map_location="cpu")
+        validate_resume_checkpoint(
+            checkpoint=resume_checkpoint,
+            args=args,
+            train_trajs=train_trajs,
+            valid_trajs=valid_trajs,
+            aux_cols=aux_cols,
+        )
+        print(f"🔁 Resuming from checkpoint: {resume_path.resolve()}")
+
     scaler_root = Path(args.scaler_root)
-    scaler_dir = scaler_root / model_name
+    if resume_checkpoint is not None and resume_checkpoint.get("scaler_dir") is not None:
+        scaler_dir = Path(resume_checkpoint["scaler_dir"])
+    else:
+        scaler_dir = scaler_root / model_name
     scaler_dir.mkdir(parents=True, exist_ok=True)
 
     data_dir = PROJECT_ROOT / "data" / "train"
@@ -344,18 +496,20 @@ def main():
         json.dump(traj_info, handle, indent=4)
     print(f"📝 Saved trajectory info to {traj_info_path}")
 
+    train_generator = build_torch_generator(seed)
+    valid_generator = build_torch_generator(seed)
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
         shuffle=True,
-        generator=build_torch_generator(seed),
+        generator=train_generator,
         worker_init_fn=seed_worker,
     )
     valid_loader = DataLoader(
         valid_dataset,
         batch_size=batch_size,
         shuffle=False,
-        generator=build_torch_generator(seed),
+        generator=valid_generator,
         worker_init_fn=seed_worker,
     )
 
@@ -372,12 +526,16 @@ def main():
     )
     model = model.to(device)
     print(f"🧩 Initialized model variant: {args.variant}")
+    num_trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Total trainable parameters: {num_trainable_params:,}")
 
     criterion = build_criterion(
         variant=args.variant,
         x_scaler=train_dataset.x_scaler,
         beta_geo=args.beta_geo,
         beta_aux=args.beta_aux,
+        w_rot=args.w_rot,
+        w_omega=args.w_omega,
     )
     criterion = criterion.to(device)
 
@@ -386,21 +544,120 @@ def main():
         optimizer, T_max=args.epochs, eta_min=lr_end
     )
 
+    wandb_run = init_wandb_run(
+        args=args,
+        project_root=PROJECT_ROOT,
+        model_name=model_name,
+        config={
+            **vars(args),
+            "model_type": "physres_ablation",
+            "train_trajs": train_trajs,
+            "valid_trajs": valid_trajs,
+            "train_runs": train_runs,
+            "valid_runs": valid_runs,
+            "batch_size": batch_size,
+            "seed": seed,
+            "dt": dt,
+            "device": str(device),
+            "use_aux": use_aux,
+            "resolved_aux_cols": resolved_aux_cols,
+            "aux_dim": aux_dim,
+            "hidden_dim": hidden_dim,
+            "num_layers": num_layers,
+            "residual_input_dim": residual_input_dim,
+            "model_path": model_path,
+            "scaler_dir": scaler_dir,
+            "num_trainable_params": num_trainable_params,
+            "train_dataset_size": len(train_dataset),
+            "valid_dataset_size": len(valid_dataset),
+            "phys_params": phys_params,
+            "lr_start": lr_start,
+            "lr_end": lr_end,
+        },
+        tags=["physres-ablation", args.variant, *train_trajs],
+        group=f"physres_ablation__{'_'.join(train_trajs)}",
+    )
+    maybe_watch_model(wandb_run, model, args)
+
     best_val_loss = float("inf")
     best_epoch = None
+    start_epoch = 0
 
-    for epoch in range(args.epochs):
+    if args.save_latest_every > 0:
+        print(
+            f"🔁 Latest resumable checkpoint will be updated every "
+            f"{args.save_latest_every} epoch(s): {latest_path}"
+        )
+
+    if resume_checkpoint is not None:
+        model.load_state_dict(resume_checkpoint["model_state"])
+
+        if "optimizer_state" in resume_checkpoint:
+            optimizer.load_state_dict(resume_checkpoint["optimizer_state"])
+            move_optimizer_state_to_device(optimizer, device)
+        else:
+            print("⚠️ Resume checkpoint is missing optimizer state. Optimizer will restart.")
+
+        if "scheduler_state" in resume_checkpoint:
+            scheduler.load_state_dict(resume_checkpoint["scheduler_state"])
+        else:
+            scheduler._last_lr = [group["lr"] for group in optimizer.param_groups]
+            print(
+                "⚠️ Resume checkpoint is missing scheduler state. "
+                "Learning-rate schedule will restart from the current script settings."
+            )
+
+        best_val_loss = resume_checkpoint.get(
+            "best_val_loss",
+            resume_checkpoint.get("val_loss", float("inf")),
+        )
+        best_epoch = resume_checkpoint.get("best_epoch")
+        start_epoch = max(resume_checkpoint.get("epoch", -1) + 1, 0)
+
+        print(
+            f"🔁 Restored epoch {resume_checkpoint.get('completed_epoch', start_epoch)} "
+            f"and will continue from epoch {start_epoch + 1}/{args.epochs}"
+        )
+        if best_epoch is not None:
+            print(
+                f"🏁 Best checkpoint so far: epoch {best_epoch} "
+                f"with valid loss {best_val_loss:.6f}"
+            )
+
+        if start_epoch >= args.epochs:
+            print("✅ Resume checkpoint already reached the requested total epochs. Nothing to do.")
+            finish_run(
+                wandb_run,
+                summary={
+                    "best_epoch": best_epoch,
+                    "best_val_loss": best_val_loss,
+                    "model_path": model_path,
+                    "variant": args.variant,
+                    "resume_path": str(resume_path.resolve()),
+                },
+            )
+            return
+
+    for epoch in range(start_epoch, args.epochs):
+        epoch_start = time.time()
         model.train()
         train_metric_totals = init_metric_totals()
+        train_grad_norm_total = 0.0
+        train_grad_norm_max = 0.0
+        train_generator.manual_seed(seed + epoch)
 
         for batch in tqdm(train_loader, desc=f"Epoch {epoch + 1}/{args.epochs} [Train]"):
             optimizer.zero_grad()
             total_loss, loss_dict = compute_loss(model, criterion, batch, device, args.variant)
             total_loss.backward()
+            grad_norm = compute_gradient_norm(model)
+            train_grad_norm_total += grad_norm
+            train_grad_norm_max = max(train_grad_norm_max, grad_norm)
             optimizer.step()
             update_metric_totals(train_metric_totals, loss_dict)
 
         avg_train_metrics = average_metrics(train_metric_totals, len(train_loader))
+        avg_train_grad_norm = train_grad_norm_total / len(train_loader)
 
         model.eval()
         valid_metric_totals = init_metric_totals()
@@ -411,6 +668,7 @@ def main():
 
         avg_valid_metrics = average_metrics(valid_metric_totals, len(valid_loader))
         current_lr = scheduler.get_last_lr()[0]
+        is_best = avg_valid_metrics["loss_total"] < best_val_loss
 
         log_msg = (
             f"Epoch {epoch + 1}/{args.epochs} | LR={current_lr:.2e} | "
@@ -429,12 +687,21 @@ def main():
             )
         print(log_msg)
 
+        if is_best:
+            best_val_loss = avg_valid_metrics["loss_total"]
+            best_epoch = epoch + 1
+
+        scheduler.step()
+
         checkpoint = build_checkpoint(
             model=model,
             optimizer=optimizer,
+            scheduler=scheduler,
             epoch=epoch,
             train_metrics=avg_train_metrics,
             val_metrics=avg_valid_metrics,
+            best_val_loss=best_val_loss,
+            best_epoch=best_epoch,
             variant=args.variant,
             hidden_dim=hidden_dim,
             num_layers=num_layers,
@@ -443,32 +710,64 @@ def main():
             alpha_init=args.alpha_init,
             aux_cols=resolved_aux_cols,
             aux_dim=aux_dim,
+            beta_geo=args.beta_geo,
+            beta_aux=args.beta_aux,
+            w_rot=args.w_rot,
+            w_omega=args.w_omega,
             phys_params=phys_params,
             dt=dt,
             horizon=args.horizon,
+            total_epochs=args.epochs,
+            lr_start=lr_start,
+            lr_end=lr_end,
+            batch_size=batch_size,
             scaler_dir=scaler_dir,
             train_trajs=train_trajs,
             valid_trajs=valid_trajs,
             seed=seed,
         )
 
+        if args.save_latest_every > 0 and (epoch + 1) % args.save_latest_every == 0:
+            atomic_torch_save(checkpoint, latest_path)
+
         if args.save_every > 0 and (epoch + 1) % args.save_every == 0:
             periodic_path = model_dir / f"{model_name}__epoch{epoch + 1:04d}.pt"
-            torch.save(checkpoint, periodic_path)
+            atomic_torch_save(checkpoint, periodic_path)
             print(f"💾 Saved periodic checkpoint to {periodic_path}")
 
-        if avg_valid_metrics["loss_total"] < best_val_loss:
-            best_val_loss = avg_valid_metrics["loss_total"]
-            best_epoch = epoch + 1
-            torch.save(checkpoint, model_path)
+        if is_best:
+            atomic_torch_save(checkpoint, model_path)
             print(
                 f"💾 Saved best model at epoch {best_epoch} "
                 f"with valid loss {avg_valid_metrics['loss_total']:.6f}"
             )
 
-        scheduler.step()
+        wandb_metrics = {
+            "epoch": epoch + 1,
+            "optim/lr": current_lr,
+            "train/grad_norm_mean": avg_train_grad_norm,
+            "train/grad_norm_max": train_grad_norm_max,
+            "model/param_norm": compute_parameter_norm(model),
+            "best/val_loss": best_val_loss,
+            "best/epoch": best_epoch or 0,
+            "checkpoint/is_best": int(is_best),
+            "timing/epoch_sec": time.time() - epoch_start,
+        }
+        wandb_metrics.update(prefix_metrics("train", avg_train_metrics))
+        wandb_metrics.update(prefix_metrics("valid", avg_valid_metrics))
+        wandb_metrics.update(collect_lag_metrics(model))
+        log_metrics(wandb_run, wandb_metrics)
 
     print(f"✅ Training complete. Best model saved as {model_path} (epoch {best_epoch})")
+    finish_run(
+        wandb_run,
+        summary={
+            "best_epoch": best_epoch,
+            "best_val_loss": best_val_loss,
+            "model_path": model_path,
+            "variant": args.variant,
+        },
+    )
 
 
 if __name__ == "__main__":

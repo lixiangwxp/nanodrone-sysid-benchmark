@@ -4,10 +4,10 @@ import torch
 import torch.nn as nn
 from pytorch3d.transforms import so3_exp_map, so3_relative_angle
 
-from train.losses import WeightedMSELoss
+from train.losses import WeightedGeodesicLoss, WeightedMSELoss
 
 
-def clamp_rotvec(phi, max_angle=math.pi - 1e-3, eps=1e-8):
+def clamp_rotvec(phi, max_angle=math.inf, eps=1e-8):
     """Clamp rotation vectors to a safe range for SO(3) numerics."""
     angle = torch.norm(phi, dim=-1, keepdim=True)
     scale = torch.clamp(angle, max=max_angle) / (angle + eps)
@@ -77,24 +77,44 @@ class CompositeAblationLoss(nn.Module):
         x_scaler,
         lambda_mse=0.1,
         use_geo=False,
-        beta_geo=0.1,
+        beta_geo=0.01,
         use_aux=False,
         beta_aux=0.05,
         aux_loss_type="smooth_l1",
+        w_rot=2.0,
+        w_omega=2.0,
     ):
         super().__init__()
+        if x_scaler is None:
+            raise ValueError("x_scaler is required for CompositeAblationLoss")
+
         self.use_geo = use_geo
         self.beta_geo = beta_geo
         self.use_aux = use_aux
         self.beta_aux = beta_aux
+        self.w_rot = w_rot
+        self.w_omega = w_omega
 
         self.mse_loss = WeightedMSELoss(lambda_=lambda_mse)
-        self.geo_loss = (
-            DenormRotGeodesicLoss(x_scaler=x_scaler, lambda_=lambda_mse)
-            if use_geo
-            else None
+        self.register_buffer(
+            "x_mean", torch.as_tensor(x_scaler.mean_, dtype=torch.float32)
         )
+        self.register_buffer(
+            "x_scale", torch.as_tensor(x_scaler.scale_, dtype=torch.float32)
+        )
+        self.geo_loss = None
+        if use_geo:
+            self.geo_loss = WeightedGeodesicLoss(
+                lambda_=lambda_mse,
+                w_pos=0.0,
+                w_vel=0.0,
+                w_rot=w_rot,
+                w_omega=w_omega,
+            )
         self.aux_loss = self._build_aux_loss(aux_loss_type) if use_aux else None
+
+    def denorm(self, x_norm):
+        return x_norm * self.x_scale + self.x_mean
 
     @staticmethod
     def _build_aux_loss(aux_loss_type):
@@ -111,17 +131,24 @@ class CompositeAblationLoss(nn.Module):
         loss_geo = pred_seq_norm.new_tensor(0.0)
         loss_aux = pred_seq_norm.new_tensor(0.0)
 
-        total_loss = loss_mse
+        numerator = loss_mse
+        denominator = 1.0
 
         if self.use_geo:
-            loss_geo = self.geo_loss(pred_seq_norm, true_seq_norm)
-            total_loss = total_loss + self.beta_geo * loss_geo
+            pred_seq_real = self.denorm(pred_seq_norm)
+            true_seq_real = self.denorm(true_seq_norm)
+            loss_geo = self.geo_loss(pred_seq_real, true_seq_real)
+            numerator = numerator + self.beta_geo * loss_geo
+            denominator += self.beta_geo
 
         if self.use_aux:
             if aux_pred is None or aux_true is None:
                 raise ValueError("aux_pred and aux_true are required when use_aux=True")
             loss_aux = self.aux_loss(aux_pred, aux_true)
-            total_loss = total_loss + self.beta_aux * loss_aux
+            numerator = numerator + self.beta_aux * loss_aux
+            denominator += self.beta_aux
+
+        total_loss = numerator / denominator
 
         loss_dict = {
             "loss_total": total_loss.detach(),

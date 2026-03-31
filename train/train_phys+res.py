@@ -2,6 +2,7 @@ import argparse
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 import pandas as pd
@@ -19,6 +20,15 @@ from dataset.dataset import QuadDataset, combine_concat_dataset
 from models.models import PhysQuadModel, PhysResQuadModel, ResidualQuadModel
 from train.losses import WeightedMSELoss
 from utils.seed_utils import build_torch_generator, seed_worker, set_global_seed
+from utils.wandb_utils import (
+    add_wandb_args,
+    compute_gradient_norm,
+    compute_parameter_norm,
+    finish_run,
+    init_wandb_run,
+    log_metrics,
+    maybe_watch_model,
+)
 
 
 def load_split(trajs, runs, base_dir, split, horizon):
@@ -49,6 +59,7 @@ parser.add_argument("--batch-size", type=int, default=256)
 parser.add_argument("--pretrained", action="store_true")
 parser.add_argument("--name-suffix", type=str, default="", help="Optional suffix appended to the auto-generated model name")
 parser.add_argument("--seed", type=int, default=42, help="Random seed used for initialization and DataLoader shuffling")
+add_wandb_args(parser)
 args = parser.parse_args()
 
 train_trajs = json.loads(args.train_trajs)
@@ -135,6 +146,8 @@ model = PhysResQuadModel(
 ).to(device)
 
 print("🧩 Initialized PhysResQuadModel")
+num_trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+print(f"Total trainable parameters: {num_trainable_params:,}")
 
 if args.pretrained and model_path.exists():
     ckpt = torch.load(model_path, map_location=device)
@@ -148,22 +161,56 @@ optimizer = optim.Adam(model.parameters(), lr=lr_start)
 scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=lr_end)
 criterion = WeightedMSELoss(lambda_=0.1)
 
+wandb_run = init_wandb_run(
+    args=args,
+    project_root=PROJECT_ROOT,
+    model_name=model_name,
+    config={
+        **vars(args),
+        "model_type": "phys+res",
+        "train_trajs": train_trajs,
+        "valid_trajs": valid_trajs,
+        "train_runs": train_runs,
+        "valid_runs": valid_runs,
+        "lr_start": lr_start,
+        "lr_end": lr_end,
+        "dt": dt,
+        "device": str(device),
+        "model_path": model_path,
+        "scaler_dir": scaler_dir,
+        "num_trainable_params": num_trainable_params,
+        "train_dataset_size": len(train_dataset),
+        "valid_dataset_size": len(valid_dataset),
+        "phys_params": phys_params,
+    },
+    tags=["physres", *train_trajs],
+    group=f"physres__{'_'.join(train_trajs)}",
+)
+maybe_watch_model(wandb_run, model, args)
+
 best_val_loss = float("inf")
 best_epoch = None
 
 for epoch in range(epochs):
+    epoch_start = time.time()
     model.train()
     train_loss = 0.0
+    train_grad_norm_total = 0.0
+    train_grad_norm_max = 0.0
     for x0, u_seq, x_seq in tqdm(train_loader, desc=f"Epoch {epoch + 1}/{epochs} [Train]"):
         x0, u_seq, x_seq = x0.to(device), u_seq.to(device), x_seq.to(device)
         optimizer.zero_grad()
         pred_seq = model(x0, u_seq)
         loss = criterion(pred_seq, x_seq)
         loss.backward()
+        grad_norm = compute_gradient_norm(model)
+        train_grad_norm_total += grad_norm
+        train_grad_norm_max = max(train_grad_norm_max, grad_norm)
         optimizer.step()
         train_loss += loss.item()
 
     avg_train_loss = train_loss / len(train_loader)
+    avg_train_grad_norm = train_grad_norm_total / len(train_loader)
 
     model.eval()
     valid_loss = 0.0
@@ -175,11 +222,13 @@ for epoch in range(epochs):
 
     avg_valid_loss = valid_loss / len(valid_loader)
     current_lr = scheduler.get_last_lr()[0]
+    is_best = False
     print(f"Epoch {epoch + 1}, LR={current_lr:.2e}, Train={avg_train_loss:.6f}, Valid={avg_valid_loss:.6f}")
 
     if avg_valid_loss < best_val_loss:
         best_val_loss = avg_valid_loss
         best_epoch = epoch + 1
+        is_best = True
         checkpoint = {
             "model_state": model.state_dict(),
             "config": {
@@ -200,6 +249,31 @@ for epoch in range(epochs):
         torch.save(checkpoint, model_path)
         print(f"💾 Saved best model at epoch {best_epoch} with valid loss {avg_valid_loss:.6f}")
 
+    log_metrics(
+        wandb_run,
+        {
+            "epoch": epoch + 1,
+            "train/loss_total": avg_train_loss,
+            "valid/loss_total": avg_valid_loss,
+            "train/grad_norm_mean": avg_train_grad_norm,
+            "train/grad_norm_max": train_grad_norm_max,
+            "model/param_norm": compute_parameter_norm(model),
+            "optim/lr": current_lr,
+            "best/val_loss": best_val_loss,
+            "best/epoch": best_epoch or 0,
+            "checkpoint/is_best": int(is_best),
+            "timing/epoch_sec": time.time() - epoch_start,
+        },
+    )
+
     scheduler.step()
 
 print(f"✅ Training complete. Best model saved as {model_path} (epoch {best_epoch})")
+finish_run(
+    wandb_run,
+    summary={
+        "best_epoch": best_epoch,
+        "best_val_loss": best_val_loss,
+        "model_path": model_path,
+    },
+)
