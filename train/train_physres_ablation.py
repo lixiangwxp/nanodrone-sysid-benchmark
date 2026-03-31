@@ -60,6 +60,10 @@ def uses_aux_supervision(variant):
     return variant == "full"
 
 
+def uses_plain_temporal_loss(variant):
+    return variant in {"baseline", "lag"}
+
+
 def build_model_name(variant, train_trajs):
     return f"physres_ablation__{variant}__{'_'.join(train_trajs)}"
 
@@ -145,7 +149,7 @@ def build_model(variant, phys_params, dt, x_scaler, u_scaler, lag_mode, alpha_in
 
 
 def build_criterion(variant, x_scaler, beta_geo, beta_aux, w_rot, w_omega):
-    if variant in {"baseline", "lag"}:
+    if uses_plain_temporal_loss(variant):
         return WeightedMSELoss(lambda_=0.1)
 
     return CompositeAblationLoss(
@@ -174,7 +178,26 @@ def average_metrics(metric_totals, num_batches):
     return {key: value / num_batches for key, value in metric_totals.items()}
 
 
-def compute_loss(model, criterion, batch, device, variant):
+def compute_mixed_temporal_loss(pred_seq, x_seq):
+    loss_exp = WeightedMSELoss(lambda_=0.03)(pred_seq, x_seq)
+    loss_uniform = torch.mean((pred_seq - x_seq) ** 2)
+    loss_tail = torch.mean((pred_seq[:, -10:] - x_seq[:, -10:]) ** 2)
+    total_loss = 0.5 * loss_exp + 0.3 * loss_uniform + 0.2 * loss_tail
+
+    zero = total_loss.detach().new_tensor(0.0)
+    loss_dict = {
+        "loss_total": total_loss.detach(),
+        "loss_mse": total_loss.detach(),
+        "loss_geo": zero,
+        "loss_aux": zero,
+        "loss_exp": loss_exp.detach(),
+        "loss_uniform": loss_uniform.detach(),
+        "loss_tail": loss_tail.detach(),
+    }
+    return total_loss, loss_dict
+
+
+def compute_loss(model, criterion, batch, device, variant, loss_type):
     use_aux = uses_aux_supervision(variant)
 
     if use_aux:
@@ -193,6 +216,9 @@ def compute_loss(model, criterion, batch, device, variant):
     x_seq = x_seq.to(device)
     pred_seq = model(x0, u_seq)
 
+    if uses_plain_temporal_loss(variant) and loss_type == "mixed":
+        return compute_mixed_temporal_loss(pred_seq, x_seq)
+
     if isinstance(criterion, CompositeAblationLoss):
         total_loss, loss_dict = criterion(pred_seq, x_seq)
         return total_loss, loss_dict
@@ -209,8 +235,9 @@ def compute_loss(model, criterion, batch, device, variant):
 
 
 def update_metric_totals(metric_totals, loss_dict):
-    for key in metric_totals:
-        metric_totals[key] += loss_dict[key].item()
+    for key, value in loss_dict.items():
+        metric_totals.setdefault(key, 0.0)
+        metric_totals[key] += value.item()
 
 
 def build_checkpoint(
@@ -241,6 +268,7 @@ def build_checkpoint(
     lr_start,
     lr_end,
     batch_size,
+    loss_type,
     scaler_dir,
     train_trajs,
     valid_trajs,
@@ -270,6 +298,7 @@ def build_checkpoint(
             "lr_start": lr_start,
             "lr_end": lr_end,
             "batch_size": batch_size,
+            "loss_type": loss_type,
         },
         "phys_params": phys_params,
         "optimizer_state": optimizer.state_dict(),
@@ -332,6 +361,9 @@ def validate_resume_checkpoint(checkpoint, args, train_trajs, valid_trajs, aux_c
         ("valid_trajs", valid_trajs, checkpoint.get("valid_trajs")),
     ]
 
+    if config.get("loss_type") is not None:
+        expected_pairs.append(("loss_type", args.loss_type, config.get("loss_type")))
+
     if config.get("beta_geo") is not None:
         expected_pairs.append(("beta_geo", args.beta_geo, config.get("beta_geo")))
     if config.get("w_rot") is not None:
@@ -374,6 +406,7 @@ def main():
     parser.add_argument("--epochs", type=int, default=500)
     parser.add_argument("--horizon", type=int, default=50)
     parser.add_argument("--variant", type=str, default="baseline", choices=VARIANT_CHOICES)
+    parser.add_argument("--loss-type", type=str, default="exp", choices=["exp", "mixed"])
     parser.add_argument("--beta_geo", type=float, default=0.01)
     parser.add_argument("--beta_aux", type=float, default=0.05)
     parser.add_argument("--w_rot", type=float, default=2.0)
@@ -381,6 +414,12 @@ def main():
     parser.add_argument("--lag_mode", type=str, default="per_motor", choices=["shared", "per_motor"])
     parser.add_argument("--alpha_init", type=float, default=0.85)
     parser.add_argument("--aux_cols", type=str, default='["az_body"]')
+    parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument(
+        "--pin-memory",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     parser.add_argument("--save_every", type=int, default=0)
     parser.add_argument("--save_latest_every", type=int, default=1)
     parser.add_argument(
@@ -391,11 +430,6 @@ def main():
     )
     parser.add_argument("--out_model_dir", type=str, default=str(PROJECT_ROOT / "out" / "models"))
     parser.add_argument("--scaler_root", type=str, default=str(PROJECT_ROOT / "scalers"))
-    parser.add_argument(
-        "--deterministic",
-        action="store_true",
-        help="Slower, stricter GPU reproducibility (cuDNN deterministic, no autotune).",
-    )
     add_wandb_args(parser)
     args = parser.parse_args()
 
@@ -415,8 +449,8 @@ def main():
         os.environ["CUDA_VISIBLE_DEVICES"] = device_str.split(":")[-1]
     device = torch.device(device_str if torch.cuda.is_available() else "cpu")
 
-    set_global_seed(seed, deterministic=args.deterministic)
-    print(f"🌱 Global seed set to: {seed} (deterministic={args.deterministic})")
+    set_global_seed(seed)
+    print(f"🌱 Global seed set to: {seed}")
 
     model_name = build_model_name(args.variant, train_trajs)
     print(f"🧠 Model name composed automatically: {model_name}")
@@ -504,6 +538,8 @@ def main():
         shuffle=True,
         generator=train_generator,
         worker_init_fn=seed_worker,
+        num_workers=args.num_workers,
+        pin_memory=args.pin_memory,
     )
     valid_loader = DataLoader(
         valid_dataset,
@@ -511,6 +547,8 @@ def main():
         shuffle=False,
         generator=valid_generator,
         worker_init_fn=seed_worker,
+        num_workers=args.num_workers,
+        pin_memory=args.pin_memory,
     )
 
     phys_params = build_phys_params()
@@ -536,8 +574,9 @@ def main():
         beta_aux=args.beta_aux,
         w_rot=args.w_rot,
         w_omega=args.w_omega,
-    )
-    criterion = criterion.to(device)
+    ) if not (uses_plain_temporal_loss(args.variant) and args.loss_type == "mixed") else None
+    if criterion is not None:
+        criterion = criterion.to(device)
 
     optimizer = optim.Adam(model.parameters(), lr=lr_start)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(
@@ -648,7 +687,14 @@ def main():
 
         for batch in tqdm(train_loader, desc=f"Epoch {epoch + 1}/{args.epochs} [Train]"):
             optimizer.zero_grad()
-            total_loss, loss_dict = compute_loss(model, criterion, batch, device, args.variant)
+            total_loss, loss_dict = compute_loss(
+                model,
+                criterion,
+                batch,
+                device,
+                args.variant,
+                args.loss_type,
+            )
             total_loss.backward()
             grad_norm = compute_gradient_norm(model)
             train_grad_norm_total += grad_norm
@@ -663,7 +709,14 @@ def main():
         valid_metric_totals = init_metric_totals()
         with torch.no_grad():
             for batch in valid_loader:
-                _, loss_dict = compute_loss(model, criterion, batch, device, args.variant)
+                _, loss_dict = compute_loss(
+                    model,
+                    criterion,
+                    batch,
+                    device,
+                    args.variant,
+                    args.loss_type,
+                )
                 update_metric_totals(valid_metric_totals, loss_dict)
 
         avg_valid_metrics = average_metrics(valid_metric_totals, len(valid_loader))
@@ -684,6 +737,13 @@ def main():
             log_msg += (
                 f" | TrainAux={avg_train_metrics['loss_aux']:.6f}"
                 f" | ValidAux={avg_valid_metrics['loss_aux']:.6f}"
+            )
+        if "loss_exp" in avg_train_metrics:
+            log_msg += (
+                f" | TrainExp={avg_train_metrics['loss_exp']:.6f}"
+                f" | ValidExp={avg_valid_metrics['loss_exp']:.6f}"
+                f" | TrainTail={avg_train_metrics['loss_tail']:.6f}"
+                f" | ValidTail={avg_valid_metrics['loss_tail']:.6f}"
             )
         print(log_msg)
 
@@ -721,6 +781,7 @@ def main():
             lr_start=lr_start,
             lr_end=lr_end,
             batch_size=batch_size,
+            loss_type=args.loss_type,
             scaler_dir=scaler_dir,
             train_trajs=train_trajs,
             valid_trajs=valid_trajs,
