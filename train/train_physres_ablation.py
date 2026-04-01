@@ -3,6 +3,7 @@ import json
 import os
 import sys
 import time
+from contextlib import nullcontext
 from pathlib import Path
 
 import pandas as pd
@@ -326,6 +327,12 @@ def compute_loss(model, criterion, batch, device, variant, loss_type):
     return total_loss, loss_dict
 
 
+def build_autocast_context(device, enabled):
+    if not enabled or device.type != "cuda":
+        return nullcontext()
+    return torch.cuda.amp.autocast(dtype=torch.float16)
+
+
 def update_metric_totals(metric_totals, loss_dict):
     for key, value in loss_dict.items():
         metric_totals.setdefault(key, 0.0)
@@ -406,6 +413,7 @@ def build_checkpoint(
     batch_size,
     gru_hidden_dim,
     loss_type,
+    amp_enabled,
     scaler_dir,
     train_trajs,
     valid_trajs,
@@ -438,6 +446,7 @@ def build_checkpoint(
             "batch_size": batch_size,
             "gru_hidden_dim": gru_hidden_dim if variant in {"lag_gru", "lag_gru_force"} else None,
             "loss_type": loss_type,
+            "amp": amp_enabled,
         },
         "phys_params": phys_params,
         "optimizer_state": optimizer.state_dict(),
@@ -502,6 +511,10 @@ def validate_resume_checkpoint(checkpoint, args, train_trajs, valid_trajs, aux_c
 
     if config.get("loss_type") is not None:
         expected_pairs.append(("loss_type", args.loss_type, config.get("loss_type")))
+    if config.get("lr_start") is not None:
+        expected_pairs.append(("lr_start", args.lr_start, config.get("lr_start")))
+    if config.get("lr_end") is not None:
+        expected_pairs.append(("lr_end", args.lr_end, config.get("lr_end")))
     if config.get("hidden_dim") is not None:
         expected_pairs.append(("hidden_dim", args.hidden_dim, config.get("hidden_dim")))
     if args.variant in {"lag_gru", "lag_gru_force"} and config.get("gru_hidden_dim") is not None:
@@ -550,9 +563,12 @@ def main():
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--epochs", type=int, default=500)
     parser.add_argument("--horizon", type=int, default=50)
+    parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--variant", type=str, default="baseline", choices=VARIANT_CHOICES)
     parser.add_argument("--hidden-dim", type=int, default=64)
     parser.add_argument("--gru-hidden-dim", type=int, default=64)
+    parser.add_argument("--lr-start", "--lr_start", dest="lr_start", type=float, default=1e-5)
+    parser.add_argument("--lr-end", "--lr_end", dest="lr_end", type=float, default=1e-8)
     parser.add_argument("--loss-type", type=str, default="exp", choices=["exp", "mixed"])
     parser.add_argument("--beta_geo", type=float, default=0.01)
     parser.add_argument("--beta_aux", type=float, default=0.05)
@@ -567,6 +583,12 @@ def main():
         "--pin-memory",
         action=argparse.BooleanOptionalAction,
         default=True,
+    )
+    parser.add_argument(
+        "--amp",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable CUDA automatic mixed precision for faster training.",
     )
     parser.add_argument("--save_every", type=int, default=0)
     parser.add_argument("--save_latest_every", type=int, default=1)
@@ -597,19 +619,21 @@ def main():
     train_runs = [1, 2, 3]
     valid_runs = [4]
     valid_trajs = train_trajs
-    batch_size = 256
+    batch_size = args.batch_size
     dt = 0.01
-    lr_start = 1e-5
-    lr_end = 1e-8
+    lr_start = args.lr_start
+    lr_end = args.lr_end
     seed = 42
 
     device_str = args.device
     if device_str.startswith("cuda"):
         os.environ["CUDA_VISIBLE_DEVICES"] = device_str.split(":")[-1]
     device = torch.device(device_str if torch.cuda.is_available() else "cpu")
+    amp_enabled = bool(args.amp and device.type == "cuda")
 
     set_global_seed(seed)
     print(f"🌱 Global seed set to: {seed}")
+    print(f"⚙️ Batch size: {batch_size} | AMP enabled: {amp_enabled}")
 
     model_name = build_model_name(args.variant, train_trajs)
     print(f"🧠 Model name composed automatically: {model_name}")
@@ -795,6 +819,7 @@ def main():
     scheduler = optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=args.epochs, eta_min=lr_end
     )
+    scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled)
 
     wandb_run = init_wandb_run(
         args=args,
@@ -826,6 +851,7 @@ def main():
             "phys_params": phys_params,
             "lr_start": lr_start,
             "lr_end": lr_end,
+            "amp": amp_enabled,
         },
         tags=["physres-ablation", args.variant, *train_trajs],
         group=f"physres_ablation__{'_'.join(train_trajs)}",
@@ -900,21 +926,24 @@ def main():
         train_generator.manual_seed(seed + epoch)
 
         for batch in tqdm(train_loader, desc=f"Epoch {epoch + 1}/{args.epochs} [Train]"):
-            optimizer.zero_grad()
-            total_loss, loss_dict = compute_loss(
-                model,
-                criterion,
-                batch,
-                device,
-                args.variant,
-                args.loss_type,
-            )
-            total_loss.backward()
+            optimizer.zero_grad(set_to_none=True)
+            with build_autocast_context(device, amp_enabled):
+                total_loss, loss_dict = compute_loss(
+                    model,
+                    criterion,
+                    batch,
+                    device,
+                    args.variant,
+                    args.loss_type,
+                )
+            scaler.scale(total_loss).backward()
+            scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             grad_norm = compute_gradient_norm(model)
             train_grad_norm_total += grad_norm
             train_grad_norm_max = max(train_grad_norm_max, grad_norm)
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
             update_metric_totals(train_metric_totals, loss_dict)
 
         avg_train_metrics = average_metrics(train_metric_totals, len(train_loader))
@@ -924,14 +953,15 @@ def main():
         valid_metric_totals = init_metric_totals()
         with torch.no_grad():
             for batch in valid_loader:
-                _, loss_dict = compute_loss(
-                    model,
-                    criterion,
-                    batch,
-                    device,
-                    args.variant,
-                    args.loss_type,
-                )
+                with build_autocast_context(device, amp_enabled):
+                    _, loss_dict = compute_loss(
+                        model,
+                        criterion,
+                        batch,
+                        device,
+                        args.variant,
+                        args.loss_type,
+                    )
                 update_metric_totals(valid_metric_totals, loss_dict)
 
         avg_valid_metrics = average_metrics(valid_metric_totals, len(valid_loader))
@@ -1004,6 +1034,7 @@ def main():
             batch_size=batch_size,
             gru_hidden_dim=args.gru_hidden_dim,
             loss_type=args.loss_type,
+            amp_enabled=amp_enabled,
             scaler_dir=scaler_dir,
             train_trajs=train_trajs,
             valid_trajs=valid_trajs,

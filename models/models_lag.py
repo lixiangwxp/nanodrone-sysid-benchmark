@@ -380,7 +380,7 @@ class LagPhysResGRUForceModel(LagPhysResGRUModel):
         nn.init.zeros_(self.force_head[-1].weight)
         nn.init.zeros_(self.force_head[-1].bias)
 
-    def forward(self, x0, u_seq):
+    def forward(self, x0, u_seq, return_force: bool = False):
         if u_seq.ndim == 2:
             u_seq = u_seq.unsqueeze(1)
         if x0.ndim == 3:
