@@ -184,7 +184,7 @@ class WeightedGeodesicLoss(nn.Module):
         p_gt,   v_gt,   r_gt,   w_gt   = true[..., :3], true[..., 3:6], true[..., 6:9], true[..., 9:12]
 
         # --- Clamp rotation vectors to avoid crazy angles ---
-        r_pred = clamp_rotvec(r_pred)
+        r_pred = clamp_rotvec(r_pred)#
         # r_gt   = clamp_rotvec(r_gt)
 
         # --- MSE terms ---

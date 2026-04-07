@@ -27,7 +27,7 @@ class MotorLagLayer(nn.Module):
         alpha = self.alpha.view(*([1] * (u_raw.ndim - 1)), -1)
         return alpha * u_eff_prev + (1.0 - alpha) * u_raw
 
-
+#在「物理模型 + 残差网络」的基础上，多了一层「电机指令→等效转速」的一阶滞后，并沿时间一步步 roll 出整段预测。
 class LagPhysResQuadModel(nn.Module):
     """
     Physics + residual model with actuator lag memory.
@@ -35,6 +35,9 @@ class LagPhysResQuadModel(nn.Module):
     Inputs are expected in normalized space:
       x_norm: [pos(3), vel(3), so3_log(3), omega(3)]
       u_norm: raw motor angular speeds
+      外部传进来的 x_norm、u_norm 已是标准化后的张量
+      12 维状态拆成：位置 3、速度 3、旋转李代数 3、角速度 3
+      u 是 4 路电机角速度(raw 指令)。
     """
 
     def __init__(
@@ -142,40 +145,51 @@ class LagPhysResQuadModel(nn.Module):
         )
 
         T_norm = T / self.phys.T_max
-        tau_norm = torch.stack([tau_x, tau_y, tau_z], dim=1) / self.phys.max_torque
+        tau_norm = torch.stack([tu_x, tau_y, tau_z], dim=1) / self.phys.max_torque
         return torch.cat([T_norm.unsqueeze(1), tau_norm], dim=1)
-
+    #
     def physics_step_from_motors(self, x_real, u_eff_real):
-        """Run one physics step from motor speeds while staying in the 12D state space."""
+        """Run one physics step from motor speeds while staying in the 12D state space.
+        p, v, r(so3_log), ω，其中姿态在接口上是 3 维，内部临时换成 quaternion 做积分。
+
+"""
         pos = x_real[:, 0:3]
         vel = x_real[:, 3:6]
         so3 = x_real[:, 6:9]
         omega = x_real[:, 9:12]
 
         quat = self.phys.so3_log_to_quat(so3)
-        x_quat = torch.cat([pos, vel, quat, omega], dim=-1)
-        u_phys = self.motor_to_phys_diff(u_eff_real)
+        x_quat = torch.cat([pos, vel, quat, omega], dim=-1)#(B,13)
+        u_phys = self.motor_to_phys_diff(u_eff_real)#4个转速变成力
 
         x_next_quat = self.phys._step_from_phys(x_quat, u_phys)
-        pos_next = x_next_quat[:, 0:3]
+        #_step_from_phys 吃的是「机体合力/合力矩」而不是原始 4 个 ω。
+        pos_next = x_next_quat[:, 0:3]#_step_from_phys 吃的是「机体合力/合力矩」而不是原始 4 个 ω。
         vel_next = x_next_quat[:, 3:6]
-        quat_next = x_next_quat[:, 6:10]
+        quat_next = x_next_quat[:, 6:10]#4元数
         omega_next = x_next_quat[:, 10:13]
-        so3_next = self.phys.quat_to_so3_log(quat_next)
+        so3_next = self.phys.quat_to_so3_log(quat_next)#转回3维
 
         return torch.cat([pos_next, vel_next, so3_next, omega_next], dim=-1)
 
+
+#输入：x0：初始状态，归一化，形状 (B,12) 或 (B,1,12)。
+#u_seq：电机角速度序列，归一化，(B,T,4) 或 (B,4)（后者会先变成单步 (B,1,4)）。
+#输出：pred_seq：(B,T,12)，每一步预测后的归一化状态。
+#若 return_aux=True 且建了 aux_head，还会返回 aux_pred_seq。
     def forward(self, x0, u_seq, return_aux=False):
         if u_seq.ndim == 2:
-            u_seq = u_seq.unsqueeze(1)
+            u_seq = u_seq.unsqueeze(1)#(B,4) -> (B,1,4)
         if x0.ndim == 3:
-            x_norm = x0.squeeze(1)
+            x_norm = x0.squeeze(1)#(B,1,12) -> (B,12)
         else:
-            x_norm = x0
+            x_norm = x0#(B,12)
 
         if x_norm.ndim != 2:
+            #保证 x 是二维
             raise ValueError("x0 must have shape (B,12) or (B,1,12)")
         if u_seq.ndim != 3 or u_seq.shape[-1] != 4:
+            #保证 u_seq 是 3 维且最后一维是 4 路电机
             raise ValueError("u_seq must have shape (B,T,4) or (B,4)")
 
         _, horizon, _ = u_seq.shape
@@ -185,13 +199,16 @@ class LagPhysResQuadModel(nn.Module):
         u_eff_prev_real = self.u_denorm(u_seq[:, 0, :])
 
         for t in range(horizon):
+            #当前指令 + 滞后 → 等效转速
             u_raw_norm = u_seq[:, t, :]
             u_raw_real = self.u_denorm(u_raw_norm)
+            #等效转速 = 当前转速 + 上一步等效
             u_eff_real = self.lag_layer(u_eff_prev_real, u_raw_real)
 
             x_real = self.x_denorm(x_norm)
             # Keep the physics rollout fixed while preserving gradients through lag -> residual.
             with torch.no_grad():
+                # 物理一步（在物理空间里滚），需要等效转速，输出仍是 12D 物理状态。
                 x_phys_next_real = self.physics_step_from_motors(x_real, u_eff_real)
             x_phys_next_norm = self.x_normed(x_phys_next_real)
 
@@ -200,9 +217,13 @@ class LagPhysResQuadModel(nn.Module):
                 [u_raw_norm, u_eff_norm, u_raw_norm - u_eff_norm],
                 dim=-1,
             )
-
+            #输入给 MLP 的特征：x 和 u 的差异。12+12=24
             residual_in = torch.cat([x_norm, feat_u], dim=-1)
+
+            #与状态同维 12，加在物理预测的归一化状态上，补齐模型误差。
             dx_res = self.residual.out(self.residual.mlp(residual_in))
+
+            #残差预测 + 物理预测，「p, v, so3_log(r), ω」
             x_next_norm = x_phys_next_norm + dx_res
 
             finite_mask = torch.isfinite(x_next_norm).all(dim=-1, keepdim=True)
@@ -229,8 +250,12 @@ class LagPhysResQuadModel(nn.Module):
 
 
 class LagPhysResGRUModel(LagPhysResQuadModel):
-    """Physics + residual model with GRU-conditioned dynamic actuator lag."""
-
+    """Physics + residual model with GRU-conditioned dynamic actuator lag.
+    这一步改动旨在引入一个简单的循环模块和动态滞后机制，而不改变物理模型和残差 MLP 的核心结构。
+    通过 GRUCell 维护一个隐藏状态 h_t,模型可以记忆先前步长的信息；
+    通过 alpha_head 动态生成滞后系数a,使执行器的惯性更贴合不同状态；
+    然后残差 MLP 的输入由 [x_norm, u_raw_norm, u_eff_norm, h_t] 组成，可以利用记忆修正长期偏差。
+    """
     def __init__(
         self,
         phys,
@@ -241,7 +266,7 @@ class LagPhysResGRUModel(LagPhysResQuadModel):
         alpha_init=0.85,
         hidden_dim=64,
     ):
-        nn.Module.__init__(self)
+        nn.Module.__init__(self)#基类初始化
         if not isinstance(phys, PhysQuadModel):
             raise TypeError("phys must be an instance of PhysQuadModel")
         if not isinstance(residual, ResidualQuadModel):
@@ -255,33 +280,47 @@ class LagPhysResGRUModel(LagPhysResQuadModel):
         self.aux_head = None
         self.lag_layer = MotorLagLayer(lag_mode=lag_mode, alpha_init=alpha_init)
         self.gru_hidden_dim = hidden_dim
-
+        
         state_dim = residual.out.out_features
+        #state_dim：与状态/残差同维，12（最后一层Linear输出 12）。
+
         control_dim = 4
+
+
         feature_dim = state_dim + 3 * control_dim + hidden_dim
         self._validate_residual_input(
             state_dim=state_dim,
             control_feat_dim=3 * control_dim + hidden_dim,
         )
+        #残差网络吃的是 [x_norm, u_raw, u_eff, u_raw-u_eff, h]——和无 GRU 版不同，无 GRU 时没有 h，只有 state_dim + 12。
 
         x_mean, x_scale = self._scaler_to_tensors(x_scaler, state_dim)
         u_mean, u_scale = self._scaler_to_tensors(u_scaler, control_dim)
 
+
+        #保存归一化参数，避免在 forward 中反复计算。
         self.register_buffer("x_mean", x_mean)
         self.register_buffer("x_scale", x_scale)
         self.register_buffer("u_mean", u_mean)
         self.register_buffer("u_scale", u_scale)
 
         self.h_init = nn.Sequential(nn.Linear(state_dim, hidden_dim), nn.Tanh())
+        #h，形状 (B, hidden_dim)
+
+        #由当前状态、指令、滞后 seed、GRU 记忆共同决定这一步的混合系数。
         self.alpha_head = nn.Sequential(
             nn.Linear(feature_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, 1),
         )
         self.gru_cell = nn.GRUCell(feature_dim, hidden_dim)
+        #h是可变的、有记忆的中间向量：每一步都会根据当前输入gru_in和上一步的h更新一次。
 
     @staticmethod
     def _pack_gru_features(x_norm, u_raw_norm, u_eff_norm, h):
+        #输入：x_norm, u_raw_norm, u_eff_norm, h
+        #输出：[x_norm, u_raw_norm, u_eff_norm, u_raw_norm - u_eff_norm, h]
+        #用于将当前状态、指令、滞后 seed、GRU 记忆共同决定这一步的混合系数。
         return torch.cat(
             [x_norm, u_raw_norm, u_eff_norm, u_raw_norm - u_eff_norm, h],
             dim=-1,
@@ -368,13 +407,19 @@ class LagPhysResGRUForceModel(LagPhysResGRUModel):
             nn.Linear(state_dim + control_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, control_dim),
-        )
+        )#输入维 12 + 4 = 16，输入维 4。
+
         self.force_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, 3),
         )
-
+        #输入维 hidden_dim：在 forward 里接的是 GRU 隐状态 h（与父类里的 gru_hidden_dim 一致，默认 64）。
+        #输出 3 维：机体坐标系下的残差外力Δf_b，交给物理里的 apply_force
+        #在电机动力学之外再补一项力。
+       
+       #「新分支从零扰动开始」，避免随机初始化破坏物理 rollout。
+       #
         nn.init.zeros_(self.u_init_head[-1].weight)
         nn.init.zeros_(self.u_init_head[-1].bias)
         nn.init.zeros_(self.force_head[-1].weight)

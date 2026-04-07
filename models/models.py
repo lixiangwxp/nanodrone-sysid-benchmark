@@ -287,6 +287,9 @@ class ResidualQuadModel(BaseQuadModel):
         xu = torch.cat([x, u], dim=-1)
         dx = self.out(self.mlp(xu))
         return x + dx
+        #改正的是状态 x（位姿、速度等）
+        #控制 u 已经进 MLP 当条件
+        #输出的 dx 只作用在状态上，不会莫名其妙改 u。
 
 # ============================================================
 # === 3. Physics+Residual model (Physics + NN correction)
@@ -326,13 +329,16 @@ class PhysResQuadModel(BaseQuadModel):
 
     def one_step(self, x_norm, u_norm):
         # 1) Denormalize to real space (no CPU hops)
+        #反归一化，phys.one_step 需要 真实状态 + 真实电机转速。
         x_real = self.x_denorm(x_norm)
         u_mot = self.u_denorm(u_norm) # motors
 
         # 2) physics next state (real → then back to norm)
+        # 物理预测，物理模型需要真实状态 + 真实电机转速。
         with torch.no_grad():
             x_phys_next_real = self.phys.one_step(x_real, u_mot)  # (B,12)
         x_phys_next_norm = self.x_normed(x_phys_next_real)
+        #x_phys_next_norm：再压回 归一化空间，后面和 **dx_res_norm 同一空间相加。
 
         # 3) NN predicts *residual step* Δx_res in normalized space
         #    Use the residual head directly to get dx, not x+dx

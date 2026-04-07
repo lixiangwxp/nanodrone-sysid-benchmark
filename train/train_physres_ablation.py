@@ -227,7 +227,6 @@ def init_metric_totals():
 def average_metrics(metric_totals, num_batches):
     return {key: value / num_batches for key, value in metric_totals.items()}
 
-
 def compute_mixed_temporal_loss(pred_seq, x_seq):
     loss_exp = WeightedMSELoss(lambda_=0.03)(pred_seq, x_seq)
     loss_uniform = torch.mean((pred_seq - x_seq) ** 2)
