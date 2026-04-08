@@ -3,16 +3,24 @@
 __pycache__/
 *.pyc
 .ipynb_checkpoints/
-.idea
+.idea/
 .DS_Store
+.env
 
 # Large / reproducible run artifacts
-out/models/
-out/models_smoke/
-out/predictions/
-out/export/
-out/benchmark_summary.csv
+out/
 logs/
+
+# Model weights (use Git LFS or external storage for these)
+*.pt
+*.pth
+*.onnx
+
+# Weights & Biases
+wandb/
+
+# Reproducible generated plots (regenerate via analysis scripts)
+plots/
 
 # Local experiment backups (not part of canonical repo tree)
 backups/
