@@ -79,8 +79,15 @@ def uses_plain_temporal_loss(variant):
     return variant in {"baseline", "lag", "lag_gru", "lag_gru_force"}
 
 
-def build_model_name(variant, train_trajs):
-    return f"physres_ablation__{variant}__{'_'.join(train_trajs)}"
+def build_model_name(variant, train_trajs, loss_type="exp", name_suffix=""):
+    parts = ["physres_ablation", variant]
+    if uses_plain_temporal_loss(variant):
+        parts.append(loss_type)
+    parts.append("_".join(train_trajs))
+    model_name = "__".join(parts)
+    if name_suffix:
+        model_name = f"{model_name}_{name_suffix}"
+    return model_name
 
 
 def build_phys_params():
@@ -417,6 +424,7 @@ def build_checkpoint(
     train_trajs,
     valid_trajs,
     seed,
+    name_suffix,
 ):
     return {
         "model_state": model.state_dict(),
@@ -446,6 +454,7 @@ def build_checkpoint(
             "gru_hidden_dim": gru_hidden_dim if variant in {"lag_gru", "lag_gru_force"} else None,
             "loss_type": loss_type,
             "amp": amp_enabled,
+            "name_suffix": name_suffix,
         },
         "phys_params": phys_params,
         "optimizer_state": optimizer.state_dict(),
@@ -461,7 +470,12 @@ def build_checkpoint(
         "train_trajs": train_trajs,
         "valid_trajs": valid_trajs,
         "seed": seed,
-        "model_name": build_model_name(variant, train_trajs),
+        "model_name": build_model_name(
+            variant,
+            train_trajs,
+            loss_type=loss_type,
+            name_suffix=name_suffix,
+        ),
         "scaler_dir": str(scaler_dir),
     }
 
@@ -569,6 +583,12 @@ def main():
     parser.add_argument("--lr-start", "--lr_start", dest="lr_start", type=float, default=1e-5)
     parser.add_argument("--lr-end", "--lr_end", dest="lr_end", type=float, default=1e-8)
     parser.add_argument("--loss-type", type=str, default="exp", choices=["exp", "mixed"])
+    parser.add_argument(
+        "--name-suffix",
+        type=str,
+        default="",
+        help="Optional suffix appended to the auto-generated model name",
+    )
     parser.add_argument("--beta_geo", type=float, default=0.01)
     parser.add_argument("--beta_aux", type=float, default=0.05)
     parser.add_argument("--beta-force", type=float, default=0.1)
@@ -634,7 +654,12 @@ def main():
     print(f"🌱 Global seed set to: {seed}")
     print(f"⚙️ Batch size: {batch_size} | AMP enabled: {amp_enabled}")
 
-    model_name = build_model_name(args.variant, train_trajs)
+    model_name = build_model_name(
+        args.variant,
+        train_trajs,
+        loss_type=args.loss_type,
+        name_suffix=args.name_suffix,
+    )
     print(f"🧠 Model name composed automatically: {model_name}")
 
     model_dir = Path(args.out_model_dir)
@@ -1038,6 +1063,7 @@ def main():
             train_trajs=train_trajs,
             valid_trajs=valid_trajs,
             seed=seed,
+            name_suffix=args.name_suffix,
         )
 
         if args.save_latest_every > 0 and (epoch + 1) % args.save_latest_every == 0:

@@ -65,6 +65,7 @@ def load_checkpoint(model_path, device):
 
 
 parser = argparse.ArgumentParser(description="Evaluate a trained physics+residual model on the test trajectories")
+parser.add_argument("--model-path", type=str, default=None, help="Explicit checkpoint path to evaluate")
 parser.add_argument("--model-index", type=int, default=None, help="1-based index in the displayed model list")
 parser.add_argument("--test-trajs", type=str, default='["melon"]')
 parser.add_argument("--batch-size", type=int, default=128)
@@ -82,25 +83,31 @@ data_dir = PROJECT_ROOT / "data" / "test"
 # ---------------------------------------------------------------------
 # === Locate trained model automatically ===
 # ---------------------------------------------------------------------
-model_root = PROJECT_ROOT / "out" / "models"
-model_files = sorted(
-    [f.name for f in model_root.iterdir() if f.is_file() and f.name.startswith("phys+res") and f.suffix == ".pt"],
-    key=lambda x: os.path.getmtime(model_root / x),
-    reverse=True,
-)
+if args.model_path is not None:
+    model_path = Path(args.model_path).expanduser().resolve()
+    if not model_path.exists():
+        raise FileNotFoundError(f"❌ Model checkpoint not found: {model_path}")
+    model_name = model_path.stem
+else:
+    model_root = PROJECT_ROOT / "out" / "models"
+    model_files = sorted(
+        [f.name for f in model_root.iterdir() if f.is_file() and f.name.startswith("phys+res") and f.suffix == ".pt"],
+        key=lambda x: os.path.getmtime(model_root / x),
+        reverse=True,
+    )
 
-if not model_files:
-    raise RuntimeError(f"❌ No trained model found in {model_root}")
+    if not model_files:
+        raise RuntimeError(f"❌ No trained model found in {model_root}")
 
-print("\n📂 Available trained models:")
-for idx, name in enumerate(model_files, start=1):
-    mtime = os.path.getmtime(model_root / name)
-    print(f"  [{idx}] {name}  (modified: {pd.to_datetime(mtime, unit='s'):%Y-%m-%d %H:%M})")
+    print("\n📂 Available trained models:")
+    for idx, name in enumerate(model_files, start=1):
+        mtime = os.path.getmtime(model_root / name)
+        print(f"  [{idx}] {name}  (modified: {pd.to_datetime(mtime, unit='s'):%Y-%m-%d %H:%M})")
 
-choice = select_model_index(len(model_files), args.model_index)
-model_file = model_files[choice - 1]
-model_name = model_file.replace(".pt", "")
-model_path = model_root / model_file
+    choice = select_model_index(len(model_files), args.model_index)
+    model_file = model_files[choice - 1]
+    model_name = model_file.replace(".pt", "")
+    model_path = model_root / model_file
 
 print(f"\n✅ Selected model: {model_name}")
 

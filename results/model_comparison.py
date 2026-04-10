@@ -56,6 +56,97 @@ def require_csv(path):
     return pd.read_csv(path)
 
 
+def load_manifest(path):
+    with open(path, "r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def build_summary_row(model_name, metrics):
+    sim_p, sim_v, sim_r, sim_w = compute_simerr(metrics)
+    return {
+        "model": model_name,
+        "pos_h1": metrics["pos"][1],
+        "pos_h10": metrics["pos"][10],
+        "pos_h50": metrics["pos"][50],
+        "vel_h1": metrics["vel"][1],
+        "vel_h10": metrics["vel"][10],
+        "vel_h50": metrics["vel"][50],
+        "rot_h1": metrics["rot"][1],
+        "rot_h10": metrics["rot"][10],
+        "rot_h50": metrics["rot"][50],
+        "omega_h1": metrics["omega"][1],
+        "omega_h10": metrics["omega"][10],
+        "omega_h50": metrics["omega"][50],
+        "sim_pos": sim_p,
+        "sim_vel": sim_v,
+        "sim_rot": sim_r,
+        "sim_omega": sim_w,
+    }
+
+
+def build_full12_summary_row(experiment, metrics):
+    row = build_summary_row(experiment["model_label"], metrics)
+    row["model_label"] = experiment["model_label"]
+    row["model_family"] = experiment["model_family"]
+    row["loss_name"] = experiment["loss_name"]
+    return row
+
+
+def summarize_manifest(manifest_path, summary_path, max_horizon, expected_count=None):
+    manifest = load_manifest(manifest_path)
+    experiments = manifest.get("experiments", [])
+    completed_experiments = [
+        experiment
+        for experiment in experiments
+        if experiment.get("status") == "completed" and experiment.get("prediction_path")
+    ]
+
+    if not completed_experiments:
+        raise RuntimeError("❌ No completed experiments with prediction files were found in the manifest")
+
+    if expected_count is not None and len(completed_experiments) != expected_count:
+        raise RuntimeError(
+            "❌ Completed experiment count does not match expectation: "
+            f"expected {expected_count}, found {len(completed_experiments)}"
+        )
+
+    summary_rows = []
+    for experiment in completed_experiments:
+        df_pred = add_rotation_columns(require_csv(Path(experiment["prediction_path"])))
+        metrics = compute_errors(df_pred, max_horizon)
+        summary_rows.append(build_full12_summary_row(experiment, metrics))
+
+    summary_df = pd.DataFrame(summary_rows)
+    column_order = [
+        "model_label",
+        "model_family",
+        "loss_name",
+        "model",
+        "pos_h1",
+        "pos_h10",
+        "pos_h50",
+        "vel_h1",
+        "vel_h10",
+        "vel_h50",
+        "rot_h1",
+        "rot_h10",
+        "rot_h50",
+        "omega_h1",
+        "omega_h10",
+        "omega_h50",
+        "sim_pos",
+        "sim_vel",
+        "sim_rot",
+        "sim_omega",
+    ]
+    summary_df = summary_df[column_order]
+    summary_path.parent.mkdir(parents=True, exist_ok=True)
+    summary_df.to_csv(summary_path, index=False)
+    print(f"\n💾 Saved summary to {summary_path}")
+    print("\n=== Summary ===")
+    print(summary_df.to_string(index=False))
+
+
 parser = argparse.ArgumentParser(description="Compare benchmark prediction results across models")
 parser.add_argument("--train-trajs", type=str, default='["random", "square", "chirp"]')
 parser.add_argument("--test-trajs", type=str, default='["melon"]')
@@ -63,6 +154,8 @@ parser.add_argument("--predictions-dir", type=str, default=str(PROJECT_ROOT / "o
 parser.add_argument("--max-horizon", type=int, default=50)
 parser.add_argument("--show-plots", action="store_true")
 parser.add_argument("--summary-path", type=str, default=str(PROJECT_ROOT / "out" / "benchmark_summary.csv"))
+parser.add_argument("--manifest-path", type=str, default=None, help="Optional batch manifest for full-12 summary mode")
+parser.add_argument("--expected-count", type=int, default=None, help="Optional expected number of completed experiments in manifest mode")
 args = parser.parse_args()
 
 setup_matplotlib()
@@ -72,6 +165,18 @@ test_trajs = json.loads(args.test_trajs)
 predictions_dir = Path(args.predictions_dir)
 summary_path = Path(args.summary_path)
 summary_path.parent.mkdir(parents=True, exist_ok=True)
+
+if args.max_horizon < 50:
+    raise ValueError("--max-horizon must be at least 50 for the fixed *_h50 summary columns")
+
+if args.manifest_path is not None:
+    summarize_manifest(
+        manifest_path=Path(args.manifest_path),
+        summary_path=summary_path,
+        max_horizon=args.max_horizon,
+        expected_count=args.expected_count,
+    )
+    sys.exit(0)
 
 train_name = "_".join(train_trajs)
 test_name = "_".join(test_trajs)
@@ -140,25 +245,12 @@ for model_name in model_order:
     mm = model_metrics[model_name]
     sim_p, sim_v, sim_r, sim_w = compute_simerr(mm)
 
-    summary_rows.append({
-        "model": model_name,
-        "pos_h1": mm["pos"][1],
-        "pos_h10": mm["pos"][10],
-        "pos_h50": mm["pos"][target_horizons[-1]],
-        "vel_h1": mm["vel"][1],
-        "vel_h10": mm["vel"][10],
-        "vel_h50": mm["vel"][target_horizons[-1]],
-        "rot_h1": mm["rot"][1],
-        "rot_h10": mm["rot"][10],
-        "rot_h50": mm["rot"][target_horizons[-1]],
-        "omega_h1": mm["omega"][1],
-        "omega_h10": mm["omega"][10],
-        "omega_h50": mm["omega"][target_horizons[-1]],
-        "sim_pos": sim_p,
-        "sim_vel": sim_v,
-        "sim_rot": sim_r,
-        "sim_omega": sim_w,
-    })
+    summary_row = build_summary_row(model_name, mm)
+    summary_row["pos_h50"] = mm["pos"][target_horizons[-1]]
+    summary_row["vel_h50"] = mm["vel"][target_horizons[-1]]
+    summary_row["rot_h50"] = mm["rot"][target_horizons[-1]]
+    summary_row["omega_h50"] = mm["omega"][target_horizons[-1]]
+    summary_rows.append(summary_row)
 
     latex_rows.append([
         model_name,

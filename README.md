@@ -165,6 +165,36 @@ The process to benchmark the execution time is as follows:
 * Profile on the _STM32F469I-DISCO_ board, which matches the Crazyflie's STM32F405 in terms of CPU micro-architecture and memory hierarchy
 * Rescale the profiled execution times to account for the different clock rates (180MHz vs 168MHz, respectively)
 
+### 5. Full-12 Batch Run on Linux
+
+To run the full set of 12 unique `model+loss` experiments on a Linux machine and summarize them into a single CSV:
+
+```bash
+bash run_full12.sh --stamp full12_$(date +%Y%m%d_%H%M%S)
+```
+
+This runner:
+
+- trains each experiment sequentially with W&B logging enabled
+- evaluates each checkpoint immediately after training
+- refreshes `out/benchmark_summary_full12.csv` after each completed experiment
+- writes per-experiment logs under `out/logs/<stamp>/`
+- stores a manifest under `out/manifests/<stamp>.json`
+- performs a final completeness check on `out/benchmark_summary_full12.csv` via the existing `results/model_comparison.py` script in manifest mode
+
+For a quick smoke test on a single experiment:
+
+```bash
+bash run_full12.sh --stamp smoke_$(date +%Y%m%d_%H%M%S) --only residual_weighted_mse --epochs 1
+```
+
+The batch runner is designed to be used from `tmux`, for example:
+
+```bash
+tmux new -s nd_full12
+bash run_full12.sh --stamp full12_$(date +%Y%m%d_%H%M%S)
+```
+
 ## Models Description
 
 `models/models.py` implements:
