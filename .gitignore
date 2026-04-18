@@ -6,6 +6,7 @@ __pycache__/
 .idea/
 .DS_Store
 .env
+.codex
 
 # Large / reproducible run artifacts
 out/
@@ -28,3 +29,6 @@ backups/
 # Smoke-test & ablation scaler dirs (main scalers e.g. lstm_random_square_chirp stay tracked)
 scalers/*_smoke/
 scalers/physres_ablation__*/
+
+# Timestamped full12 scaler artifacts
+scalers/*_full12_[0-9]*/
