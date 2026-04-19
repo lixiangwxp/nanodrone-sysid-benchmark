@@ -27,6 +27,7 @@ from models.models_lag import (
 )
 from train.losses import WeightedMSELoss
 from train.losses_ext import CompositeAblationLoss
+from utils.early_stopping import get_wait_count, is_improvement, should_stop_early
 from utils.seed_utils import build_torch_generator, seed_worker, set_global_seed
 from utils.wandb_utils import (
     add_wandb_args,
@@ -425,6 +426,9 @@ def build_checkpoint(
     valid_trajs,
     seed,
     name_suffix,
+    early_stop_patience,
+    early_stop_min_delta,
+    early_stop_start_epoch,
 ):
     return {
         "model_state": model.state_dict(),
@@ -455,6 +459,9 @@ def build_checkpoint(
             "loss_type": loss_type,
             "amp": amp_enabled,
             "name_suffix": name_suffix,
+            "early_stop_patience": early_stop_patience,
+            "early_stop_min_delta": early_stop_min_delta,
+            "early_stop_start_epoch": early_stop_start_epoch,
         },
         "phys_params": phys_params,
         "optimizer_state": optimizer.state_dict(),
@@ -505,6 +512,16 @@ def resolve_checkpoint_path(raw_path, model_dir, model_name):
     return Path(raw_path).expanduser()
 
 
+def ensure_resume_checkpoint_is_resumable(resume_path, best_model_path):
+    if Path(resume_path).resolve() == Path(best_model_path).resolve():
+        raise ValueError(
+            "The best-model checkpoint is not a resumable checkpoint because it does "
+            "not preserve optimizer, scheduler, and early-stopping history beyond the "
+            "epoch where the best model was found. Use --resume_path latest or an "
+            "explicit latest/periodic checkpoint path instead."
+        )
+
+
 def validate_resume_checkpoint(checkpoint, args, train_trajs, valid_trajs, aux_cols):
     if "model_state" not in checkpoint:
         raise KeyError("Resume checkpoint is missing 'model_state'")
@@ -521,6 +538,26 @@ def validate_resume_checkpoint(checkpoint, args, train_trajs, valid_trajs, aux_c
         ("train_trajs", train_trajs, checkpoint.get("train_trajs")),
         ("valid_trajs", valid_trajs, checkpoint.get("valid_trajs")),
     ]
+    if config.get("early_stop_patience") is not None:
+        expected_pairs.append(
+            ("early_stop_patience", args.early_stop_patience, config.get("early_stop_patience"))
+        )
+    if config.get("early_stop_min_delta") is not None:
+        expected_pairs.append(
+            (
+                "early_stop_min_delta",
+                args.early_stop_min_delta,
+                config.get("early_stop_min_delta"),
+            )
+        )
+    if config.get("early_stop_start_epoch") is not None:
+        expected_pairs.append(
+            (
+                "early_stop_start_epoch",
+                args.early_stop_start_epoch,
+                config.get("early_stop_start_epoch"),
+            )
+        )
 
     if config.get("loss_type") is not None:
         expected_pairs.append(("loss_type", args.loss_type, config.get("loss_type")))
@@ -575,6 +612,9 @@ def main():
     parser.add_argument("--train_trajs", type=str, default='["random","square","chirp"]')
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--epochs", type=int, default=500)
+    parser.add_argument("--early-stop-patience", type=int, default=0, help="Stop after this many epochs without validation improvement; 0 disables early stopping")
+    parser.add_argument("--early-stop-min-delta", type=float, default=0.0, help="Minimum validation-loss improvement required to reset early stopping")
+    parser.add_argument("--early-stop-start-epoch", type=int, default=0, help="Do not evaluate early stopping before this epoch number (1-indexed)")
     parser.add_argument("--horizon", type=int, default=50)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--variant", type=str, default="baseline", choices=VARIANT_CHOICES)
@@ -615,7 +655,7 @@ def main():
         "--resume_path",
         type=str,
         default=None,
-        help="Checkpoint path to resume from, or 'latest'/'best' for this run.",
+        help="Resumable checkpoint path to continue training from, or 'latest' for this run.",
     )
     parser.add_argument("--out_model_dir", type=str, default=str(PROJECT_ROOT / "out" / "models"))
     parser.add_argument("--scaler_root", type=str, default=str(PROJECT_ROOT / "scalers"))
@@ -671,6 +711,7 @@ def main():
     resume_checkpoint = None
     resume_path = resolve_checkpoint_path(args.resume_path, model_dir, model_name)
     if resume_path is not None:
+        ensure_resume_checkpoint_is_resumable(resume_path, model_path)
         if not resume_path.exists():
             raise FileNotFoundError(f"❌ Resume checkpoint not found: {resume_path}")
         resume_checkpoint = torch.load(resume_path, map_location="cpu")
@@ -885,6 +926,7 @@ def main():
     best_val_loss = float("inf")
     best_epoch = None
     start_epoch = 0
+    stopped_early = False
 
     if args.save_latest_every > 0:
         print(
@@ -937,6 +979,7 @@ def main():
                     "model_path": model_path,
                     "variant": args.variant,
                     "resume_path": str(resume_path.resolve()),
+                    "stopped_early": False,
                 },
             )
             return
@@ -990,7 +1033,17 @@ def main():
 
         avg_valid_metrics = average_metrics(valid_metric_totals, len(valid_loader))
         current_lr = scheduler.get_last_lr()[0]
-        is_best = avg_valid_metrics["loss_total"] < best_val_loss
+        is_best = is_improvement(
+            avg_valid_metrics["loss_total"],
+            best_val_loss,
+            args.early_stop_min_delta,
+        )
+        early_stop_wait = get_wait_count(
+            epoch + 1,
+            best_epoch,
+            start_epoch=args.early_stop_start_epoch,
+        )
+        early_stop_triggered = False
 
         log_msg = (
             f"Epoch {epoch + 1}/{args.epochs} | LR={current_lr:.2e} | "
@@ -1024,8 +1077,29 @@ def main():
         if is_best:
             best_val_loss = avg_valid_metrics["loss_total"]
             best_epoch = epoch + 1
+            early_stop_wait = 0
+        else:
+            early_stop_wait = get_wait_count(
+                epoch + 1,
+                best_epoch,
+                start_epoch=args.early_stop_start_epoch,
+            )
+            early_stop_triggered = should_stop_early(
+                current_epoch=epoch + 1,
+                best_epoch=best_epoch,
+                start_epoch=args.early_stop_start_epoch,
+                patience=args.early_stop_patience,
+            )
+            if early_stop_triggered:
+                stopped_early = True
+                print(
+                    f"⏹️ Early stopping triggered at epoch {epoch + 1}/{args.epochs} "
+                    f"after {early_stop_wait} epoch(s) without sufficient validation improvement. "
+                    f"Best epoch: {best_epoch}, best val loss: {best_val_loss:.6f}"
+                )
 
-        scheduler.step()
+        if not early_stop_triggered:
+            scheduler.step()
 
         checkpoint = build_checkpoint(
             model=model,
@@ -1064,6 +1138,9 @@ def main():
             valid_trajs=valid_trajs,
             seed=seed,
             name_suffix=args.name_suffix,
+            early_stop_patience=args.early_stop_patience,
+            early_stop_min_delta=args.early_stop_min_delta,
+            early_stop_start_epoch=args.early_stop_start_epoch,
         )
 
         if args.save_latest_every > 0 and (epoch + 1) % args.save_latest_every == 0:
@@ -1090,6 +1167,8 @@ def main():
             "best/val_loss": best_val_loss,
             "best/epoch": best_epoch or 0,
             "checkpoint/is_best": int(is_best),
+            "early_stop/wait_count": early_stop_wait,
+            "early_stop/triggered": int(early_stop_triggered),
             "timing/epoch_sec": time.time() - epoch_start,
         }
         wandb_metrics.update(prefix_metrics("train", avg_train_metrics))
@@ -1097,7 +1176,13 @@ def main():
         wandb_metrics.update(collect_lag_metrics(model))
         log_metrics(wandb_run, wandb_metrics)
 
-    print(f"✅ Training complete. Best model saved as {model_path} (epoch {best_epoch})")
+        if early_stop_triggered:
+            break
+
+    if stopped_early:
+        print(f"✅ Training stopped early. Best model saved as {model_path} (epoch {best_epoch})")
+    else:
+        print(f"✅ Training complete. Best model saved as {model_path} (epoch {best_epoch})")
     finish_run(
         wandb_run,
         summary={
@@ -1105,6 +1190,7 @@ def main():
             "best_val_loss": best_val_loss,
             "model_path": model_path,
             "variant": args.variant,
+            "stopped_early": stopped_early,
         },
     )
 

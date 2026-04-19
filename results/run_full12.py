@@ -237,6 +237,12 @@ def build_train_command(spec, args, checkpoint_path, wandb_group, wandb_run_name
         args.device,
         "--epochs",
         str(args.epochs),
+        "--early-stop-patience",
+        str(args.early_stop_patience),
+        "--early-stop-min-delta",
+        str(args.early_stop_min_delta),
+        "--early-stop-start-epoch",
+        str(args.early_stop_start_epoch),
         "--horizon",
         str(args.horizon),
         "--batch-size",
@@ -374,6 +380,9 @@ def parse_args():
     parser.add_argument("--test-trajs", type=str, default=json.dumps(TEST_TRAJS_DEFAULT))
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--epochs", type=int, default=500)
+    parser.add_argument("--early-stop-patience", type=int, default=0)
+    parser.add_argument("--early-stop-min-delta", type=float, default=0.0)
+    parser.add_argument("--early-stop-start-epoch", type=int, default=0)
     parser.add_argument("--horizon", type=int, default=50)
     parser.add_argument("--train-batch-size", type=int, default=256)
     parser.add_argument("--test-batch-size", type=int, default=128)

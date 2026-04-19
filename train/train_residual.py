@@ -19,6 +19,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from dataset.dataset import QuadDataset, combine_concat_dataset
 from models.models import ResidualQuadModel
 from train.losses import WeightedMSELoss
+from utils.early_stopping import get_wait_count, is_improvement, should_stop_early
 from utils.seed_utils import build_torch_generator, seed_worker, set_global_seed
 from utils.wandb_utils import (
     add_wandb_args,
@@ -54,6 +55,9 @@ parser = argparse.ArgumentParser(description="Train the residual quadrotor model
 parser.add_argument("--train_trajs", type=str, default='["random", "square", "chirp"]')
 parser.add_argument("--device", type=str, default="cuda:0")
 parser.add_argument("--epochs", type=int, default=500)
+parser.add_argument("--early-stop-patience", type=int, default=0, help="Stop after this many epochs without validation improvement; 0 disables early stopping")
+parser.add_argument("--early-stop-min-delta", type=float, default=0.0, help="Minimum validation-loss improvement required to reset early stopping")
+parser.add_argument("--early-stop-start-epoch", type=int, default=0, help="Do not evaluate early stopping before this epoch number (1-indexed)")
 parser.add_argument("--horizon", type=int, default=50)
 parser.add_argument("--batch-size", type=int, default=256)
 parser.add_argument("--pretrained", action="store_true")
@@ -173,6 +177,7 @@ maybe_watch_model(wandb_run, model, args)
 
 best_val_loss = float("inf")
 best_epoch = None
+stopped_early = False
 
 for epoch in range(epochs):
     epoch_start = time.time()
@@ -206,12 +211,19 @@ for epoch in range(epochs):
     avg_valid_loss = valid_loss / len(valid_loader)
     current_lr = scheduler.get_last_lr()[0]
     is_best = False
+    early_stop_wait = get_wait_count(
+        epoch + 1,
+        best_epoch,
+        start_epoch=args.early_stop_start_epoch,
+    )
+    early_stop_triggered = False
     print(f"Epoch {epoch + 1}, LR={current_lr:.2e}, Train={avg_train_loss:.6f}, Valid={avg_valid_loss:.6f}")
 
-    if avg_valid_loss < best_val_loss:
+    if is_improvement(avg_valid_loss, best_val_loss, args.early_stop_min_delta):
         best_val_loss = avg_valid_loss
         best_epoch = epoch + 1
         is_best = True
+        early_stop_wait = 0
         checkpoint = {
             "model_state": model.state_dict(),
             "config": {
@@ -220,6 +232,9 @@ for epoch in range(epochs):
                 "hidden_dim": model.hidden_dim,
                 "num_layers": model.num_layers,
                 "dt": model.dt,
+                "early_stop_patience": args.early_stop_patience,
+                "early_stop_min_delta": args.early_stop_min_delta,
+                "early_stop_start_epoch": args.early_stop_start_epoch,
             },
             "optimizer_state": optimizer.state_dict(),
             "epoch": epoch,
@@ -231,6 +246,26 @@ for epoch in range(epochs):
         }
         torch.save(checkpoint, model_path)
         print(f"💾 Saved best model at epoch {best_epoch} with valid loss {avg_valid_loss:.6f}")
+
+    if not is_best:
+        early_stop_wait = get_wait_count(
+            epoch + 1,
+            best_epoch,
+            start_epoch=args.early_stop_start_epoch,
+        )
+        early_stop_triggered = should_stop_early(
+            current_epoch=epoch + 1,
+            best_epoch=best_epoch,
+            start_epoch=args.early_stop_start_epoch,
+            patience=args.early_stop_patience,
+        )
+        if early_stop_triggered:
+            stopped_early = True
+            print(
+                f"⏹️ Early stopping triggered at epoch {epoch + 1}/{epochs} "
+                f"after {early_stop_wait} epoch(s) without sufficient validation improvement. "
+                f"Best epoch: {best_epoch}, best val loss: {best_val_loss:.6f}"
+            )
 
     log_metrics(
         wandb_run,
@@ -245,18 +280,27 @@ for epoch in range(epochs):
             "best/val_loss": best_val_loss,
             "best/epoch": best_epoch or 0,
             "checkpoint/is_best": int(is_best),
+            "early_stop/wait_count": early_stop_wait,
+            "early_stop/triggered": int(early_stop_triggered),
             "timing/epoch_sec": time.time() - epoch_start,
         },
     )
 
+    if early_stop_triggered:
+        break
+
     scheduler.step()
 
-print(f"✅ Training complete. Best model saved as {model_path} (epoch {best_epoch})")
+if stopped_early:
+    print(f"✅ Training stopped early. Best model saved as {model_path} (epoch {best_epoch})")
+else:
+    print(f"✅ Training complete. Best model saved as {model_path} (epoch {best_epoch})")
 finish_run(
     wandb_run,
     summary={
         "best_epoch": best_epoch,
         "best_val_loss": best_val_loss,
         "model_path": model_path,
+        "stopped_early": stopped_early,
     },
 )
