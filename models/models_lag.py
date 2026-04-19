@@ -1,3 +1,5 @@
+import math
+
 import torch
 import torch.nn as nn
 
@@ -63,6 +65,8 @@ class LagPhysResQuadModel(nn.Module):
         self.use_aux_head = use_aux_head
         self.aux_dim = aux_dim
         self.lag_layer = MotorLagLayer(lag_mode=lag_mode, alpha_init=alpha_init)
+        for param in self.phys.parameters():
+            param.requires_grad_(False)
 
         state_dim = residual.out.out_features
         control_dim = 4
@@ -145,7 +149,7 @@ class LagPhysResQuadModel(nn.Module):
         )
 
         T_norm = T / self.phys.T_max
-        tau_norm = torch.stack([tu_x, tau_y, tau_z], dim=1) / self.phys.max_torque
+        tau_norm = torch.stack([tau_x, tau_y, tau_z], dim=1) / self.phys.max_torque
         return torch.cat([T_norm.unsqueeze(1), tau_norm], dim=1)
     #
     def physics_step_from_motors(self, x_real, u_eff_real):
@@ -206,10 +210,8 @@ class LagPhysResQuadModel(nn.Module):
             u_eff_real = self.lag_layer(u_eff_prev_real, u_raw_real)
 
             x_real = self.x_denorm(x_norm)
-            # Keep the physics rollout fixed while preserving gradients through lag -> residual.
-            with torch.no_grad():
-                # 物理一步（在物理空间里滚），需要等效转速，输出仍是 12D 物理状态。
-                x_phys_next_real = self.physics_step_from_motors(x_real, u_eff_real)
+            # Keep gradients through the learned effective motor speeds while phys params stay frozen.
+            x_phys_next_real = self.physics_step_from_motors(x_real, u_eff_real)
             x_phys_next_norm = self.x_normed(x_phys_next_real)
 
             u_eff_norm = self.u_normed(u_eff_real)
@@ -279,6 +281,8 @@ class LagPhysResGRUModel(LagPhysResQuadModel):
         self.aux_dim = 0
         self.aux_head = None
         self.lag_layer = MotorLagLayer(lag_mode=lag_mode, alpha_init=alpha_init)
+        for param in self.phys.parameters():
+            param.requires_grad_(False)
         self.gru_hidden_dim = hidden_dim
         
         state_dim = residual.out.out_features
@@ -313,6 +317,8 @@ class LagPhysResGRUModel(LagPhysResQuadModel):
             nn.ReLU(),
             nn.Linear(hidden_dim, 1),
         )
+        nn.init.zeros_(self.alpha_head[-1].weight)
+        nn.init.constant_(self.alpha_head[-1].bias, math.log(alpha_init / (1.0 - alpha_init)))
         self.gru_cell = nn.GRUCell(feature_dim, hidden_dim)
         #h是可变的、有记忆的中间向量：每一步都会根据当前输入gru_in和上一步的h更新一次。
 
@@ -357,8 +363,7 @@ class LagPhysResGRUModel(LagPhysResQuadModel):
             u_eff_norm = self.u_normed(u_eff_real)
 
             x_real = self.x_denorm(x_norm)
-            with torch.no_grad():
-                x_phys_next_real = self.physics_step_from_motors(x_real, u_eff_real)
+            x_phys_next_real = self.physics_step_from_motors(x_real, u_eff_real)
             x_phys_next_norm = self.x_normed(x_phys_next_real)
 
             gru_in = self._pack_gru_features(x_norm, u_raw_norm, u_eff_norm, h)
@@ -462,8 +467,7 @@ class LagPhysResGRUForceModel(LagPhysResGRUModel):
             u_eff_norm = self.u_normed(u_eff_real)
 
             x_real = self.x_denorm(x_norm)
-            with torch.no_grad():
-                x_phys_next_real = self.physics_step_from_motors(x_real, u_eff_real)
+            x_phys_next_real = self.physics_step_from_motors(x_real, u_eff_real)
 
             gru_in = self._pack_gru_features(x_norm, u_raw_norm, u_eff_norm, h)
             h = self.gru_cell(gru_in, h)

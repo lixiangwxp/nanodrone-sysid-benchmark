@@ -268,7 +268,7 @@ def maybe_compute_force_loss(model, batch, force_pred_seq, u_eff_seq_real, devic
     thrust = model.phys.Kt * (u_eff_seq_real ** 2).sum(dim=-1, keepdim=True)
     zeros = torch.zeros_like(thrust)
     f_phys_body = torch.cat([zeros, zeros, thrust], dim=-1)
-    force_target_seq = f_meas_body - f_phys_body
+    force_target_seq = (f_meas_body - f_phys_body).detach()
 
     force_loss = torch.nn.functional.smooth_l1_loss(force_pred_seq, force_target_seq)
     weighted_force_loss = beta_force * force_loss
@@ -458,6 +458,7 @@ def build_checkpoint(
             "gru_hidden_dim": gru_hidden_dim if variant in {"lag_gru", "lag_gru_force"} else None,
             "loss_type": loss_type,
             "amp": amp_enabled,
+            "seed": seed,
             "name_suffix": name_suffix,
             "early_stop_patience": early_stop_patience,
             "early_stop_min_delta": early_stop_min_delta,
@@ -617,6 +618,7 @@ def main():
     parser.add_argument("--early-stop-start-epoch", type=int, default=0, help="Do not evaluate early stopping before this epoch number (1-indexed)")
     parser.add_argument("--horizon", type=int, default=50)
     parser.add_argument("--batch-size", type=int, default=256)
+    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--variant", type=str, default="baseline", choices=VARIANT_CHOICES)
     parser.add_argument("--hidden-dim", type=int, default=64)
     parser.add_argument("--gru-hidden-dim", type=int, default=64)
@@ -682,7 +684,7 @@ def main():
     dt = 0.01
     lr_start = args.lr_start
     lr_end = args.lr_end
-    seed = 42
+    seed = args.seed
 
     device_str = args.device
     if device_str.startswith("cuda"):
