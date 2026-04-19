@@ -424,7 +424,6 @@ class LagPhysResGRUForceModel(LagPhysResGRUModel):
         #在电机动力学之外再补一项力。
        
        #「新分支从零扰动开始」，避免随机初始化破坏物理 rollout。
-       #
         nn.init.zeros_(self.u_init_head[-1].weight)
         nn.init.zeros_(self.u_init_head[-1].bias)
         nn.init.zeros_(self.force_head[-1].weight)
