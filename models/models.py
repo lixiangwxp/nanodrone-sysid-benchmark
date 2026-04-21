@@ -139,6 +139,32 @@ class PhysQuadModel(BaseQuadModel):
         x_next_real[:, 0:3] = x_next_real[:, 0:3] + self.dt * vel_delta
         return x_next_real
 
+    def apply_torque(self, x_real, delta_tau_b, x_phys_next_real=None):
+        """
+        Apply only a learned residual body-frame torque on top of a cached nominal next state.
+
+        This helper intentionally does not change the nominal physics integration path. It only
+        adds the learned residual torque contribution, so zero residual torque remains a no-op.
+        The correction currently updates angular velocity directly; orientation is then affected
+        indirectly by subsequent rollout steps.
+
+        Args:
+            x_real: (B,12) current state in real units.
+            delta_tau_b: (B,3) residual body-frame torque in real torque units.
+            x_phys_next_real: cached nominal next state in real units.
+        """
+        if x_phys_next_real is None:
+            raise ValueError("apply_torque requires x_phys_next_real to apply residual torque.")
+
+        omega_dot_res = torch.linalg.solve(
+            self.J,
+            delta_tau_b.unsqueeze(-1),
+        ).squeeze(-1)
+
+        x_next_real = x_phys_next_real.clone()
+        x_next_real[:, 9:12] = x_next_real[:, 9:12] + self.dt * omega_dot_res
+        return x_next_real
+
     def _step_from_phys(self, x, u_phys):
         """
         RK4 integration of quadrotor rigid-body dynamics.
