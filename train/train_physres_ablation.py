@@ -23,6 +23,7 @@ from models.models import PhysQuadModel, PhysResQuadModel, ResidualQuadModel
 from models.models_lag import (
     LagPhysResGRUForceModel,
     LagPhysResGRUModel,
+    LagPhysResGRUTorqueModel,
     LagPhysResQuadModel,
 )
 from train.losses import WeightedMSELoss
@@ -42,7 +43,7 @@ from utils.wandb_utils import (
 )
 
 
-VARIANT_CHOICES = ["baseline", "geo", "lag", "lag_gru", "lag_gru_force", "lag_geo", "full"]
+VARIANT_CHOICES = ["baseline", "geo", "lag", "lag_gru", "lag_gru_torque", "lag_gru_force", "lag_geo", "full"]
 DEFAULT_AUX_COLS_RAW = '["az_body"]'
 DEFAULT_FORCE_AUX_COLS = ["ax_body", "ay_body", "az_body"]
 
@@ -57,7 +58,7 @@ def parse_json_list(raw_value, arg_name):
 
 
 def uses_lag(variant):
-    return variant in {"lag", "lag_gru", "lag_gru_force", "lag_geo", "full"}
+    return variant in {"lag", "lag_gru", "lag_gru_torque", "lag_gru_force", "lag_geo", "full"}
 
 
 def uses_geo_loss(variant):
@@ -77,7 +78,7 @@ def uses_aux_dataset(variant):
 
 
 def uses_plain_temporal_loss(variant):
-    return variant in {"baseline", "lag", "lag_gru", "lag_gru_force"}
+    return variant in {"baseline", "lag", "lag_gru", "lag_gru_torque", "lag_gru_force"}
 
 
 def build_model_name(variant, train_trajs, loss_type="exp", name_suffix=""):
@@ -149,7 +150,7 @@ def build_model(
     gru_hidden_dim,
 ):
     num_layers = 5
-    if variant in {"lag_gru", "lag_gru_force"}:
+    if variant in {"lag_gru", "lag_gru_torque", "lag_gru_force"}:
         residual_input_dim = gru_hidden_dim + 12
     elif uses_lag(variant):
         residual_input_dim = 12
@@ -166,6 +167,16 @@ def build_model(
 
     if variant == "lag_gru":
         model = LagPhysResGRUModel(
+            phys=phys_model,
+            residual=residual_model,
+            x_scaler=x_scaler,
+            u_scaler=u_scaler,
+            lag_mode=lag_mode,
+            alpha_init=alpha_init,
+            hidden_dim=gru_hidden_dim,
+        )
+    elif variant == "lag_gru_torque":
+        model = LagPhysResGRUTorqueModel(
             phys=phys_model,
             residual=residual_model,
             x_scaler=x_scaler,
@@ -364,7 +375,7 @@ def update_metric_totals(metric_totals, loss_dict):
 
 def build_optimizer(model, variant, base_lr):
     weight_decay = 1e-5
-    if variant not in {"lag_gru", "lag_gru_force"}:
+    if variant not in {"lag_gru", "lag_gru_torque", "lag_gru_force"}:
         return optim.Adam(model.parameters(), lr=base_lr, weight_decay=weight_decay)
 
     grouped_ids = set()
@@ -384,6 +395,7 @@ def build_optimizer(model, variant, base_lr):
     fast_params.extend(collect_params(getattr(model, "alpha_head", None)))
 
     medium_params = collect_params(getattr(model, "gru_cell", None))
+    medium_params.extend(collect_params(getattr(model, "torque_head", None)))
     medium_params.extend(collect_params(getattr(model, "force_head", None)))
     medium_params.extend(collect_params(getattr(model, "residual", None)))
     medium_params.extend(collect_params(getattr(model, "h_init", None)))
@@ -471,7 +483,9 @@ def build_checkpoint(
             "lr_start": lr_start,
             "lr_end": lr_end,
             "batch_size": batch_size,
-            "gru_hidden_dim": gru_hidden_dim if variant in {"lag_gru", "lag_gru_force"} else None,
+            "gru_hidden_dim": (
+                gru_hidden_dim if variant in {"lag_gru", "lag_gru_torque", "lag_gru_force"} else None
+            ),
             "loss_type": loss_type,
             "amp": amp_enabled,
             "seed": seed,
@@ -584,7 +598,7 @@ def validate_resume_checkpoint(checkpoint, args, train_trajs, valid_trajs, aux_c
         expected_pairs.append(("lr_end", args.lr_end, config.get("lr_end")))
     if config.get("hidden_dim") is not None:
         expected_pairs.append(("hidden_dim", args.hidden_dim, config.get("hidden_dim")))
-    if args.variant in {"lag_gru", "lag_gru_force"} and config.get("gru_hidden_dim") is not None:
+    if args.variant in {"lag_gru", "lag_gru_torque", "lag_gru_force"} and config.get("gru_hidden_dim") is not None:
         expected_pairs.append(("gru_hidden_dim", args.gru_hidden_dim, config.get("gru_hidden_dim")))
 
     if config.get("beta_geo") is not None:

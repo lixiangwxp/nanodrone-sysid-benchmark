@@ -383,6 +383,107 @@ class LagPhysResGRUModel(LagPhysResQuadModel):
         return torch.cat(preds, dim=1)
 
 
+class LagPhysResGRUTorqueModel(LagPhysResGRUModel):
+    """GRU-conditioned lag model with learned residual body torque."""
+
+    def __init__(
+        self,
+        phys,
+        residual,
+        x_scaler,
+        u_scaler,
+        lag_mode="per_motor",
+        alpha_init=0.85,
+        hidden_dim=64,
+    ):
+        super().__init__(
+            phys=phys,
+            residual=residual,
+            x_scaler=x_scaler,
+            u_scaler=u_scaler,
+            lag_mode=lag_mode,
+            alpha_init=alpha_init,
+            hidden_dim=hidden_dim,
+        )
+
+        self.torque_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 3),
+        )
+        nn.init.zeros_(self.torque_head[-1].weight)
+        nn.init.zeros_(self.torque_head[-1].bias)
+        self.register_buffer(
+            "torque_scale",
+            0.2 * self.phys.max_torque.detach().clone().view(1, 3),
+        )
+
+    def forward(self, x0, u_seq, return_torque: bool = False):
+        if u_seq.ndim == 2:
+            u_seq = u_seq.unsqueeze(1)
+        if x0.ndim == 3:
+            x_norm = x0.squeeze(1)
+        else:
+            x_norm = x0
+
+        if x_norm.ndim != 2:
+            raise ValueError("x0 must have shape (B,12) or (B,1,12)")
+        if u_seq.ndim != 3 or u_seq.shape[-1] != 4:
+            raise ValueError("u_seq must have shape (B,T,4) or (B,4)")
+
+        _, horizon, _ = u_seq.shape
+        preds = []
+        torque_preds = [] if return_torque else None
+        h = self.h_init(x_norm)
+        u_eff_prev_real = self.u_denorm(u_seq[:, 0, :])
+
+        for t in range(horizon):
+            u_raw_norm = u_seq[:, t, :]
+            u_raw_real = self.u_denorm(u_raw_norm)
+
+            u_eff_seed_real = self.lag_layer(u_eff_prev_real, u_raw_real)
+            u_eff_seed_norm = self.u_normed(u_eff_seed_real)
+            alpha_in = self._pack_gru_features(x_norm, u_raw_norm, u_eff_seed_norm, h)
+            alpha_t = torch.sigmoid(self.alpha_head(alpha_in))
+
+            u_eff_real = alpha_t * u_eff_prev_real + (1.0 - alpha_t) * u_raw_real
+            u_eff_norm = self.u_normed(u_eff_real)
+
+            x_real = self.x_denorm(x_norm)
+            x_phys_next_real = self.physics_step_from_motors(x_real, u_eff_real)
+
+            gru_in = self._pack_gru_features(x_norm, u_raw_norm, u_eff_norm, h)
+            h = self.gru_cell(gru_in, h)
+
+            delta_tau_b = self.torque_scale * torch.tanh(self.torque_head(h))
+            x_torque_next_real = self.phys.apply_torque(
+                x_real,
+                delta_tau_b,
+                x_phys_next_real=x_phys_next_real,
+            )
+            x_torque_next_norm = self.x_normed(x_torque_next_real)
+
+            residual_in = self._pack_gru_features(x_norm, u_raw_norm, u_eff_norm, h)
+            dx_res = self.residual.out(self.residual.mlp(residual_in))
+            x_next_norm = x_torque_next_norm + dx_res
+
+            finite_mask = torch.isfinite(x_next_norm).all(dim=-1, keepdim=True)
+            x_next_norm = torch.where(finite_mask, x_next_norm, x_torque_next_norm)
+
+            preds.append(x_next_norm.unsqueeze(1))
+            if torque_preds is not None:
+                torque_preds.append(delta_tau_b.unsqueeze(1))
+            x_norm = x_next_norm
+            u_eff_prev_real = u_eff_real
+
+        pred_seq = torch.cat(preds, dim=1)
+        if not return_torque:
+            return pred_seq
+
+        torque_pred_seq = torch.cat(torque_preds, dim=1)
+        return pred_seq, torque_pred_seq
+
+
 class LagPhysResGRUForceModel(LagPhysResGRUModel):
     """GRU-conditioned lag model with learned initial lag state and residual force."""
 
@@ -508,5 +609,6 @@ __all__ = [
     "MotorLagLayer",
     "LagPhysResQuadModel",
     "LagPhysResGRUModel",
+    "LagPhysResGRUTorqueModel",
     "LagPhysResGRUForceModel",
 ]
