@@ -235,11 +235,25 @@ def init_metric_totals():
 def average_metrics(metric_totals, num_batches):
     return {key: value / num_batches for key, value in metric_totals.items()}
 
-def compute_mixed_temporal_loss(pred_seq, x_seq):
+def compute_mixed_temporal_loss(pred_seq, x_seq, profile="mixed"):
+    window = min(10, pred_seq.shape[1])
     loss_exp = WeightedMSELoss(lambda_=0.03)(pred_seq, x_seq)
     loss_uniform = torch.mean((pred_seq - x_seq) ** 2)
-    loss_tail = torch.mean((pred_seq[:, -10:] - x_seq[:, -10:]) ** 2)
-    total_loss = 0.5 * loss_exp + 0.3 * loss_uniform + 0.2 * loss_tail
+    loss_tail = torch.mean((pred_seq[:, -window:] - x_seq[:, -window:]) ** 2)
+
+    if profile == "mixed":
+        loss_early = loss_exp.detach().new_tensor(0.0)
+        total_loss = 0.5 * loss_exp + 0.3 * loss_uniform + 0.2 * loss_tail
+    elif profile == "mixed_early":
+        loss_early = torch.mean((pred_seq[:, :window] - x_seq[:, :window]) ** 2)
+        total_loss = (
+            0.35 * loss_exp
+            + 0.25 * loss_uniform
+            + 0.20 * loss_tail
+            + 0.20 * loss_early
+        )
+    else:
+        raise ValueError(f"Unsupported mixed temporal loss profile: {profile}")
 
     zero = total_loss.detach().new_tensor(0.0)
     loss_dict = {
@@ -250,6 +264,7 @@ def compute_mixed_temporal_loss(pred_seq, x_seq):
         "loss_exp": loss_exp.detach(),
         "loss_uniform": loss_uniform.detach(),
         "loss_tail": loss_tail.detach(),
+        "loss_early": loss_early.detach(),
     }
     return total_loss, loss_dict
 
@@ -283,7 +298,8 @@ def compute_loss(model, criterion, batch, device, variant, loss_type):
         x_seq = x_seq.to(device)
 
         pred_seq, force_pred_seq, u_eff_seq_real = model(x0, u_seq, return_force=True)
-        mixed_loss, loss_dict = compute_mixed_temporal_loss(pred_seq, x_seq)
+        mixed_profile = "mixed_early" if loss_type == "mixed_early" else "mixed"
+        mixed_loss, loss_dict = compute_mixed_temporal_loss(pred_seq, x_seq, profile=mixed_profile)
         weighted_force_loss, force_loss_value = maybe_compute_force_loss(
             model=model,
             batch=batch,
@@ -316,8 +332,8 @@ def compute_loss(model, criterion, batch, device, variant, loss_type):
     x_seq = x_seq.to(device)
     pred_seq = model(x0, u_seq)
 
-    if uses_plain_temporal_loss(variant) and loss_type == "mixed":
-        return compute_mixed_temporal_loss(pred_seq, x_seq)
+    if uses_plain_temporal_loss(variant) and loss_type in {"mixed", "mixed_early"}:
+        return compute_mixed_temporal_loss(pred_seq, x_seq, profile=loss_type)
 
     if isinstance(criterion, CompositeAblationLoss):
         total_loss, loss_dict = criterion(pred_seq, x_seq)
@@ -624,7 +640,7 @@ def main():
     parser.add_argument("--gru-hidden-dim", type=int, default=64)
     parser.add_argument("--lr-start", "--lr_start", dest="lr_start", type=float, default=1e-5)
     parser.add_argument("--lr-end", "--lr_end", dest="lr_end", type=float, default=1e-8)
-    parser.add_argument("--loss-type", type=str, default="exp", choices=["exp", "mixed"])
+    parser.add_argument("--loss-type", type=str, default="exp", choices=["exp", "mixed", "mixed_early"])
     parser.add_argument(
         "--name-suffix",
         type=str,
@@ -664,8 +680,8 @@ def main():
     add_wandb_args(parser)
     args = parser.parse_args()
 
-    if uses_force_supervision(args.variant) and args.loss_type != "mixed":
-        print("⚠️ lag_gru_force uses mixed temporal loss. Overriding --loss-type to 'mixed'.")
+    if uses_force_supervision(args.variant) and args.loss_type == "exp":
+        print("⚠️ lag_gru_force uses a mixed temporal loss profile. Overriding --loss-type to 'mixed'.")
         args.loss_type = "mixed"
 
     train_trajs = parse_json_list(args.train_trajs, "train_trajs")
@@ -878,7 +894,10 @@ def main():
         beta_aux=args.beta_aux,
         w_rot=args.w_rot,
         w_omega=args.w_omega,
-    ) if not (uses_plain_temporal_loss(args.variant) and args.loss_type == "mixed") else None
+    ) if not (
+        uses_plain_temporal_loss(args.variant)
+        and args.loss_type in {"mixed", "mixed_early"}
+    ) else None
     if criterion is not None:
         criterion = criterion.to(device)
 
