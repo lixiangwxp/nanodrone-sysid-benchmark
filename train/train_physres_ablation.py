@@ -26,8 +26,7 @@ from models.models_lag import (
     LagPhysResGRUTorqueModel,
     LagPhysResQuadModel,
 )
-from train.losses import WeightedMSELoss
-from train.losses_ext import CompositeAblationLoss
+from train.losses_ext import build_criterion, build_loss_config, compute_loss
 from utils.early_stopping import get_wait_count, is_improvement, should_stop_early
 from utils.seed_utils import build_torch_generator, seed_worker, set_global_seed
 from utils.wandb_utils import (
@@ -76,22 +75,15 @@ def uses_force_supervision(variant):
 def uses_aux_dataset(variant):
     return uses_aux_supervision(variant) or uses_force_supervision(variant)
 
-
-def uses_plain_temporal_loss(variant):
-    return variant in {"baseline", "lag", "lag_gru", "lag_gru_torque", "lag_gru_force"}
-
-
 def build_model_name(variant, train_trajs, loss_type="exp", name_suffix=""):
-    parts = ["physres_ablation", variant]
-    if uses_plain_temporal_loss(variant):
-        parts.append(loss_type)
-    parts.append("_".join(train_trajs))
+    parts = ["physres", variant]
+    parts.append(loss_type)
     model_name = "__".join(parts)
     if name_suffix:
         model_name = f"{model_name}_{name_suffix}"
     return model_name
 
-
+#物理主干的先验常数
 def build_phys_params():
     return {
         "g": 9.81,
@@ -102,17 +94,14 @@ def build_phys_params():
     }
 
 
+#  是“把某个数据划分里的多个 CSV 文件读进来，并转成 dataset 对象列表”的。
 def load_split(trajs, runs, data_dir, split, horizon, use_aux=False, aux_cols=None):
     datasets = []
     for traj in trajs:
         for run in runs:
             file_name = f"{traj}_20251017_run{run}.csv"
             file_path = data_dir / file_name
-            try:
-                df = pd.read_csv(file_path)
-            except Exception as exc:
-                print(f"⚠️ Skipped {file_path}: {exc}")
-                continue
+            df = pd.read_csv(file_path)
 
             if use_aux:
                 ds = QuadDatasetWithAux(
@@ -122,14 +111,8 @@ def load_split(trajs, runs, data_dir, split, horizon, use_aux=False, aux_cols=No
                     use_acc_aux=True,
                 )
             else:
-                try:
-                    ds = QuadDataset(df, horizon=horizon)
-                except Exception as exc:
-                    print(f"⚠️ Skipped {file_path}: {exc}")
-                    continue
-
+                ds = QuadDataset(df, horizon=horizon)
             datasets.append(ds)
-
     if not datasets:
         raise RuntimeError(f"❌ No datasets could be loaded for {split} from {data_dir}")
 
@@ -153,12 +136,21 @@ def build_model(
     num_layers = 5
     if variant in {"lag_gru", "lag_gru_torque", "lag_gru_force"}:
         residual_input_dim = gru_hidden_dim + 12
+        #对 lag_gru 相关的模型，残差网络看的是：GRU 隐状态（gru_hidden_dim维）和原始控制相关的12维量（u_raw：4维，u_eff：4维，u_raw - u_eff：4维），合起来就是 gru_hidden_dim + 12 维
+        #GRU 隐状态 h 可以理解成一个“学出来的记忆向量”，
+        #形状是 (B, gru_hidden_dim)。它不是显式物理量，不对应某个直接可测的状态，而是专门用来保存“12维状态和当前控制里没写出来，但对后续预测有用的信息”。
     elif uses_lag(variant):
         residual_input_dim = 12
+        #对 lag 但不带 GRU 的模型，残差网络看的是：u_raw：4维，u_eff：4维，u_raw - u_eff：4维，合起来就是 12 维
     else:
         residual_input_dim = 4
+        #残差网络只看原始控制u，也就是4个电机量。
 
+
+    #物理主干，负责按动力学积分一步
     phys_model = PhysQuadModel(phys_params, dt)
+
+    #神经网络修正项，负责学 physics 没覆盖好的误差
     residual_model = ResidualQuadModel(
         input_dim=residual_input_dim,
         hidden_dim=hidden_dim,
@@ -198,6 +190,7 @@ def build_model(
             hidden_dim=gru_hidden_dim,
         )
     elif uses_lag(variant):
+        #这一支涵盖：lag，lag_geo，full
         model = LagPhysResQuadModel(
             phys=phys_model,
             residual=residual_model,
@@ -209,6 +202,7 @@ def build_model(
             aux_dim=aux_dim,
         )
     else:
+        #不带 lag 的基础版
         model = PhysResQuadModel(
             phys=phys_model,
             residual=residual_model,
@@ -217,23 +211,10 @@ def build_model(
         )
 
     return model, hidden_dim, num_layers, residual_input_dim
+#return 只给“调用者后续还要用的结果”；最终模型本体，残差网络隐藏维度，残差网络层数，残差网络输入维度，取决于 variant
 
 
-def build_criterion(variant, x_scaler, beta_geo, beta_aux, w_rot, w_omega):
-    if uses_plain_temporal_loss(variant):
-        return WeightedMSELoss(lambda_=0.1)
 
-    return CompositeAblationLoss(
-        x_scaler=x_scaler,
-        lambda_mse=0.1,
-        use_geo=uses_geo_loss(variant),
-        beta_geo=beta_geo,
-        use_aux=uses_aux_supervision(variant),
-        beta_aux=beta_aux,
-        aux_loss_type="smooth_l1",
-        w_rot=w_rot,
-        w_omega=w_omega,
-    )
 
 
 def init_metric_totals():
@@ -245,136 +226,26 @@ def init_metric_totals():
     }
 
 
+
+#这个函数是在每个 batch 结束后，把当前 batch 的 loss 记到账本里。
+def update_metric_totals(metric_totals, loss_dict):
+    for key, value in loss_dict.items():
+        metric_totals.setdefault(key, 0.0)
+        metric_totals[key] += value.item()
+
+#把一个epoch里累计的各项loss总和，除以batch数，变成平均值。
 def average_metrics(metric_totals, num_batches):
     return {key: value / num_batches for key, value in metric_totals.items()}
 
-def compute_mixed_temporal_loss(pred_seq, x_seq, profile="mixed"):
-    window = min(10, pred_seq.shape[1])
-    loss_exp = WeightedMSELoss(lambda_=0.03)(pred_seq, x_seq)
-    loss_uniform = torch.mean((pred_seq - x_seq) ** 2)
-    loss_tail = torch.mean((pred_seq[:, -window:] - x_seq[:, -window:]) ** 2)
-
-    if profile == "mixed":
-        loss_early = loss_exp.detach().new_tensor(0.0)
-        total_loss = 0.5 * loss_exp + 0.3 * loss_uniform + 0.2 * loss_tail
-    elif profile == "mixed_early":
-        loss_early = torch.mean((pred_seq[:, :window] - x_seq[:, :window]) ** 2)
-        total_loss = (
-            0.35 * loss_exp
-            + 0.25 * loss_uniform
-            + 0.20 * loss_tail
-            + 0.20 * loss_early
-        )
-    else:
-        raise ValueError(f"Unsupported mixed temporal loss profile: {profile}")
-
-    zero = total_loss.detach().new_tensor(0.0)
-    loss_dict = {
-        "loss_total": total_loss.detach(),
-        "loss_mse": total_loss.detach(),
-        "loss_geo": zero,
-        "loss_aux": zero,
-        "loss_exp": loss_exp.detach(),
-        "loss_uniform": loss_uniform.detach(),
-        "loss_tail": loss_tail.detach(),
-        "loss_early": loss_early.detach(),
-    }
-    return total_loss, loss_dict
-
-
-def maybe_compute_force_loss(model, batch, force_pred_seq, u_eff_seq_real, device, beta_force):
-    if len(batch) < 4:
-        zero = force_pred_seq.detach().new_tensor(0.0)
-        return zero, zero
-
-    aux_seq = batch[3].to(device)
-    if aux_seq.shape[-1] < 3:
-        zero = force_pred_seq.detach().new_tensor(0.0)
-        return zero, zero
-
-    f_meas_body = model.phys.m * aux_seq[..., :3]
-    thrust = model.phys.Kt * (u_eff_seq_real ** 2).sum(dim=-1, keepdim=True)
-    zeros = torch.zeros_like(thrust)
-    f_phys_body = torch.cat([zeros, zeros, thrust], dim=-1)
-    force_target_seq = (f_meas_body - f_phys_body).detach()
-
-    force_loss = torch.nn.functional.smooth_l1_loss(force_pred_seq, force_target_seq)
-    weighted_force_loss = beta_force * force_loss
-    return weighted_force_loss, force_loss.detach()
-
-
-def compute_loss(model, criterion, batch, device, variant, loss_type):
-    if variant == "lag_gru_force":
-        x0, u_seq, x_seq = batch[:3]
-        x0 = x0.to(device)
-        u_seq = u_seq.to(device)
-        x_seq = x_seq.to(device)
-
-        pred_seq, force_pred_seq, u_eff_seq_real = model(x0, u_seq, return_force=True)
-        mixed_profile = "mixed_early" if loss_type == "mixed_early" else "mixed"
-        mixed_loss, loss_dict = compute_mixed_temporal_loss(pred_seq, x_seq, profile=mixed_profile)
-        weighted_force_loss, force_loss_value = maybe_compute_force_loss(
-            model=model,
-            batch=batch,
-            force_pred_seq=force_pred_seq,
-            u_eff_seq_real=u_eff_seq_real,
-            device=device,
-            beta_force=getattr(model, "beta_force", 0.0),
-        )
-        total_loss = mixed_loss + weighted_force_loss
-        loss_dict["loss_total"] = total_loss.detach()
-        loss_dict["loss_mse"] = mixed_loss.detach()
-        loss_dict["loss_force"] = force_loss_value
-        return total_loss, loss_dict
-
-    use_aux = uses_aux_supervision(variant)
-
-    if use_aux:
-        x0, u_seq, x_seq, aux_seq = batch
-        x0 = x0.to(device)
-        u_seq = u_seq.to(device)
-        x_seq = x_seq.to(device)
-        aux_seq = aux_seq.to(device)
-        pred_seq, aux_pred = model(x0, u_seq, return_aux=True)
-        total_loss, loss_dict = criterion(pred_seq, x_seq, aux_pred=aux_pred, aux_true=aux_seq)
-        return total_loss, loss_dict
-
-    x0, u_seq, x_seq = batch
-    x0 = x0.to(device)
-    u_seq = u_seq.to(device)
-    x_seq = x_seq.to(device)
-    pred_seq = model(x0, u_seq)
-
-    if uses_plain_temporal_loss(variant) and loss_type in {"mixed", "mixed_early"}:
-        return compute_mixed_temporal_loss(pred_seq, x_seq, profile=loss_type)
-
-    if isinstance(criterion, CompositeAblationLoss):
-        total_loss, loss_dict = criterion(pred_seq, x_seq)
-        return total_loss, loss_dict
-
-    total_loss = criterion(pred_seq, x_seq)
-    zero = total_loss.detach().new_tensor(0.0)
-    loss_dict = {
-        "loss_total": total_loss.detach(),
-        "loss_mse": total_loss.detach(),
-        "loss_geo": zero,
-        "loss_aux": zero,
-    }
-    return total_loss, loss_dict
-
-
+#加快cuda计算速度
 def build_autocast_context(device, enabled):
     if not enabled or device.type != "cuda":
         return nullcontext()
     return torch.cuda.amp.autocast(dtype=torch.float16)
 
 
-def update_metric_totals(metric_totals, loss_dict):
-    for key, value in loss_dict.items():
-        metric_totals.setdefault(key, 0.0)
-        metric_totals[key] += value.item()
 
-
+#配置怎么更新参数
 def build_optimizer(model, variant, base_lr):
     weight_decay = 1e-5
     if variant not in {"lag_gru", "lag_gru_torque", "lag_gru_force"}:
@@ -382,6 +253,7 @@ def build_optimizer(model, variant, base_lr):
 
     grouped_ids = set()
 
+    #从某个子模块里收集所有还没被收过的可训练参数
     def collect_params(module):
         params = []
         if module is None:
@@ -393,21 +265,27 @@ def build_optimizer(model, variant, base_lr):
             grouped_ids.add(id(param))
         return params
 
+    #“快学习率”的参数组
     fast_params = collect_params(getattr(model, "u_init_head", None))
     fast_params.extend(collect_params(getattr(model, "alpha_head", None)))
 
+    #“中等学习率”的参数组
     medium_params = collect_params(getattr(model, "gru_cell", None))
     medium_params.extend(collect_params(getattr(model, "torque_head", None)))
     medium_params.extend(collect_params(getattr(model, "force_head", None)))
     medium_params.extend(collect_params(getattr(model, "residual", None)))
     medium_params.extend(collect_params(getattr(model, "h_init", None)))
 
+   #把前面没归类进去的剩余可训练参数，全部归到“慢速/默认组”
     slow_params = [
         param
         for param in model.parameters()
         if param.requires_grad and id(param) not in grouped_ids
     ]
 
+
+
+    #把前面没归类进去的剩余可训练参数，全部归到“慢速/默认组”
     param_groups = []
     if fast_params:
         param_groups.append({"params": fast_params, "lr": 3e-4, "weight_decay": weight_decay})
@@ -418,7 +296,7 @@ def build_optimizer(model, variant, base_lr):
 
     return optim.Adam(param_groups, lr=base_lr, weight_decay=weight_decay)
 
-
+#把“恢复训练所需要的信息”和“复现实验所需要的信息”打包成一个字典。
 def build_checkpoint(
     model,
     optimizer,
@@ -516,6 +394,7 @@ def build_checkpoint(
         "train_trajs": train_trajs,
         "valid_trajs": valid_trajs,
         "seed": seed,
+
         "model_name": build_model_name(
             variant,
             train_trajs,
@@ -525,7 +404,8 @@ def build_checkpoint(
         "scaler_dir": str(scaler_dir),
     }
 
-
+#安全地保存 checkpoint，避免写文件写到一半时把正式文件弄坏。
+#先偷偷写临时文件，写完再一把替换掉正式文件。
 def atomic_torch_save(payload, path):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -533,44 +413,53 @@ def atomic_torch_save(payload, path):
     torch.save(payload, tmp_path)
     tmp_path.replace(path)
 
-
+#resume断点续训后用，把优化器内部保存的状态张量搬到指定设备上
 def move_optimizer_state_to_device(optimizer, device):
     for state in optimizer.state.values():
         for key, value in state.items():
             if isinstance(value, torch.Tensor):
                 state[key] = value.to(device)
 
-
+# 从一个已有 checkpoint 里加载模型权重，用来做初始化，对应微调，只加载 模型权重
 def load_init_weights(model, raw_path):
     init_from_path = Path(raw_path).expanduser()
     if not init_from_path.exists():
         raise FileNotFoundError(f"❌ Initialization checkpoint not found: {init_from_path}")
 
     init_payload = torch.load(init_from_path, map_location="cpu")
+
     init_state = (
         init_payload["model_state"]
         if isinstance(init_payload, dict) and "model_state" in init_payload
         else init_payload
     )
+
     load_result = model.load_state_dict(init_state, strict=False)
+
     resolved_path = str(init_from_path.resolve())
+
     print(f"🔁 Initialized model weights from: {resolved_path}")
+    #打印实际加载的是哪个文件，方便日志和排查。
     print(f"   missing_keys: {load_result.missing_keys}")
+    #当前模型里需要，但 checkpoint 里没有的参数
     print(f"   unexpected_keys: {load_result.unexpected_keys}")
+    #checkpoint 里有，但当前模型里不存在的参数
     return resolved_path
 
-
+#一个负责冻结参数，除了 torque_head 相关参数以外，其它参数全部冻结。局部微调。
 def freeze_non_torque_parameters(model):
     for name, param in model.named_parameters():
         param.requires_grad_(name.startswith("torque_head"))
 
-
+#一个负责统计参数量，返回可训练参数量和总参数量
 def count_parameters(model):
     total_params = sum(param.numel() for param in model.parameters())
+    #表示模型里所有参数总数，不管冻没冻结。
     trainable_params = sum(param.numel() for param in model.parameters() if param.requires_grad)
+    #只统计 requires_grad=True 的参数，也就是训练时真的会更新的参数。
     return trainable_params, total_params
 
-
+#一个负责把 resume 输入解析成真正的 checkpoint 路径
 def resolve_checkpoint_path(raw_path, model_dir, model_name):
     if raw_path is None:
         return None
@@ -580,7 +469,7 @@ def resolve_checkpoint_path(raw_path, model_dir, model_name):
         return model_dir / f"{model_name}.pt"
     return Path(raw_path).expanduser()
 
-
+#防止你拿“best model 文件”去做断点续训。
 def ensure_resume_checkpoint_is_resumable(resume_path, best_model_path):
     if Path(resume_path).resolve() == Path(best_model_path).resolve():
         raise ValueError(
@@ -590,7 +479,7 @@ def ensure_resume_checkpoint_is_resumable(resume_path, best_model_path):
             "explicit latest/periodic checkpoint path instead."
         )
 
-
+#断点续训前的配置一致性检查器
 def validate_resume_checkpoint(checkpoint, args, train_trajs, valid_trajs, aux_cols):
     if "model_state" not in checkpoint:
         raise KeyError("Resume checkpoint is missing 'model_state'")
@@ -690,7 +579,7 @@ def validate_resume_checkpoint(checkpoint, args, train_trajs, valid_trajs, aux_c
             "Please resume with the same arguments that created the checkpoint."
         )
 
-
+#训练主函数
 def main():
     parser = argparse.ArgumentParser(description="Train unified PhysRes ablation variants")
     parser.add_argument("--train_trajs", type=str, default='["random","square","chirp"]')
@@ -770,10 +659,6 @@ def main():
     if args.freeze_non_torque and args.variant != "lag_gru_torque":
         raise ValueError("--freeze-non-torque is only supported for --variant lag_gru_torque.")
 
-    if uses_force_supervision(args.variant) and args.loss_type == "exp":
-        print("⚠️ lag_gru_force uses a mixed temporal loss profile. Overriding --loss-type to 'mixed'.")
-        args.loss_type = "mixed"
-
     train_trajs = parse_json_list(args.train_trajs, "train_trajs")
     aux_cols = parse_json_list(args.aux_cols, "aux_cols")
     if uses_force_supervision(args.variant) and args.aux_cols == DEFAULT_AUX_COLS_RAW:
@@ -798,10 +683,12 @@ def main():
     device = torch.device(device_str if torch.cuda.is_available() else "cpu")
     amp_enabled = bool(args.amp and device.type == "cuda")
 
+    #设置随机种子
     set_global_seed(seed)
     print(f"🌱 Global seed set to: {seed}")
     print(f"⚙️ Batch size: {batch_size} | AMP enabled: {amp_enabled}")
 
+    #自动生成模型名，根据 variant 和训练轨迹组合成一个有意义的名字，方便区分不同实验。
     model_name = build_model_name(
         args.variant,
         train_trajs,
@@ -810,12 +697,17 @@ def main():
     )
     print(f"🧠 Model name composed automatically: {model_name}")
 
+    #准备模型输出目录
     model_dir = Path(args.out_model_dir)
     model_dir.mkdir(parents=True, exist_ok=True)
+
+    #确定两个关键文件路径
     model_path = model_dir / f"{model_name}.pt"
     latest_path = model_dir / f"{model_name}__latest.pt"
     print(f"✅ Model will be saved to: {model_path}")
 
+
+    #如果用户想断点续训，就先把 resume checkpoint 读进来并检查是否合法
     resume_checkpoint = None
     resume_path = resolve_checkpoint_path(args.resume_path, model_dir, model_name)
     if resume_path is not None:
@@ -832,6 +724,8 @@ def main():
         )
         print(f"🔁 Resuming from checkpoint: {resume_path.resolve()}")
 
+
+    #确定 scaler 目录，存放数据标准化器
     scaler_root = Path(args.scaler_root)
     if resume_checkpoint is not None and resume_checkpoint.get("scaler_dir") is not None:
         scaler_dir = Path(resume_checkpoint["scaler_dir"])
@@ -839,10 +733,14 @@ def main():
         scaler_dir = scaler_root / model_name
     scaler_dir.mkdir(parents=True, exist_ok=True)
 
+
+    #指定训练数据目录
     data_dir = PROJECT_ROOT / "data" / "train"
-    use_aux = uses_aux_supervision(args.variant)
-    use_aux_data = uses_aux_dataset(args.variant)
-    force_aux_available = uses_force_supervision(args.variant)
+
+    #根据当前 variant 决定是否需要 aux 数据
+    use_aux = uses_aux_supervision(args.variant)#要不要 aux loss
+    use_aux_data = uses_aux_dataset(args.variant)#数据集要不要多读 aux 列
+    force_aux_available = uses_force_supervision(args.variant)#：当前是不是 force-aware 这条分支
 
     try:
         train_ds = load_split(
@@ -891,6 +789,7 @@ def main():
         )
 
     if use_aux:
+    #当前 variant 真的要做 aux supervision
         train_dataset = combine_concat_dataset_with_aux(
             ConcatDataset(train_ds), scale=True, fold="train", scaler_dir=scaler_dir
         )
@@ -900,6 +799,7 @@ def main():
         resolved_aux_cols = getattr(train_ds[0], "aux_cols", aux_cols)
         aux_dim = train_dataset.aux_seq.shape[-1]
     elif force_aux_available:
+    #当前不是普通 aux supervision，但 force supervision 还可用。
         train_dataset = combine_concat_dataset_with_aux(
             ConcatDataset(train_ds),
             scale=True,
@@ -931,12 +831,32 @@ def main():
         resolved_aux_cols = aux_cols
         aux_dim = len(aux_cols)
 
+
+    #判断 force loss 这次到底能不能开启。条件是：当前 variant 是 force-aware 的分支，并且 aux 数据里至少有 3 个维度可用来监督 xddot。
+    force_loss_enabled = force_aux_available and aux_dim >= 3
+
+    #把这次训练要用的 loss 配好，比如要不要 geo/aux/force，以及 loss_type 是 exp 还是 mixed。
+    loss_config = build_loss_config(
+        loss_type=args.loss_type,
+        beta_geo=args.beta_geo,
+        beta_aux=args.beta_aux,
+        beta_force=args.beta_force,
+        w_rot=args.w_rot,
+        w_omega=args.w_omega,
+        use_geo=uses_geo_loss(args.variant),
+        use_aux=uses_aux_supervision(args.variant),
+        use_force=uses_force_supervision(args.variant) and force_loss_enabled,
+    )
+    #保存 trajectories.json：把这次 train/valid 用了哪些轨迹记下来，方便复现。
     traj_info = {"train_trajs": train_trajs, "valid_trajs": valid_trajs}
     traj_info_path = scaler_dir / "trajectories.json"
     with open(traj_info_path, "w") as handle:
         json.dump(traj_info, handle, indent=4)
     print(f"📝 Saved trajectory info to {traj_info_path}")
 
+
+
+    '''模型和训练器准备 '''
     train_generator = build_torch_generator(seed)
     valid_generator = build_torch_generator(seed)
     train_loader = DataLoader(
@@ -958,7 +878,7 @@ def main():
         pin_memory=args.pin_memory,
     )
 
-    phys_params = build_phys_params()
+    phys_params = build_phys_params()#准备物理模型常数
     model, hidden_dim, num_layers, residual_input_dim = build_model(
         variant=args.variant,
         phys_params=phys_params,
@@ -971,12 +891,13 @@ def main():
         hidden_dim=args.hidden_dim,
         gru_hidden_dim=args.gru_hidden_dim,
         torque_scale_factor=args.torque_scale_factor,
-    )
+        )#准备物理模型常数。
     model = model.to(device)
-    model.beta_force = args.beta_force
     resolved_init_from = None
+
     if args.init_from is not None:
         resolved_init_from = load_init_weights(model, args.init_from)
+
     if args.freeze_non_torque:
         freeze_non_torque_parameters(model)
         print("🔒 freeze_non_torque enabled: training torque_head parameters only.")
@@ -984,24 +905,22 @@ def main():
     num_trainable_params, num_total_params = count_parameters(model)
     print(f"Trainable parameters: {num_trainable_params:,} / {num_total_params:,}")
 
-    criterion = build_criterion(
-        variant=args.variant,
-        x_scaler=train_dataset.x_scaler,
-        beta_geo=args.beta_geo,
-        beta_aux=args.beta_aux,
-        w_rot=args.w_rot,
-        w_omega=args.w_omega,
-    ) if not (
-        uses_plain_temporal_loss(args.variant)
-        and args.loss_type in {"mixed", "mixed_early"}
-    ) else None
-    if criterion is not None:
-        criterion = criterion.to(device)
 
+    #构建损失函数
+    criterion = build_criterion(
+        loss_config=loss_config,
+        x_scaler=train_dataset.x_scaler,
+    ).to(device)
+
+    #构建优化器
     optimizer = build_optimizer(model, args.variant, lr_start)
+
+    #构建学习率调度器
     scheduler = optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=args.epochs, eta_min=lr_end
     )
+
+    #给 AMP 混合精度训练用。
     scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled)
 
     wandb_run = init_wandb_run(
@@ -1011,15 +930,11 @@ def main():
         config={
             **vars(args),
             "model_type": "physres_ablation",
-            "train_trajs": train_trajs,
-            "valid_trajs": valid_trajs,
-            "train_runs": train_runs,
-            "valid_runs": valid_runs,
-            "batch_size": batch_size,
             "seed": seed,
-            "dt": dt,
-            "device": str(device),
             "use_aux": use_aux,
+            "use_geo_loss": loss_config.use_geo,
+            "use_aux_loss": loss_config.use_aux,
+            "use_force_loss": loss_config.use_force,
             "force_aux_available": force_aux_available,
             "resolved_aux_cols": resolved_aux_cols,
             "aux_dim": aux_dim,
@@ -1034,7 +949,6 @@ def main():
             "phys_params": phys_params,
             "lr_start": lr_start,
             "lr_end": lr_end,
-            "amp": amp_enabled,
             "resolved_init_from": resolved_init_from,
         },
         tags=["physres-ablation", args.variant, *train_trajs],
@@ -1042,26 +956,23 @@ def main():
     )
     maybe_watch_model(wandb_run, model, args)
 
+
+
     best_val_loss = float("inf")
     best_epoch = None
     start_epoch = 0
     stopped_early = False
 
-    if args.save_latest_every > 0:
-        print(
-            f"🔁 Latest resumable checkpoint will be updated every "
-            f"{args.save_latest_every} epoch(s): {latest_path}"
-        )
-
+    #断点续训
     if resume_checkpoint is not None:
         model.load_state_dict(resume_checkpoint["model_state"])
-
+        #恢复优化器状态
         if "optimizer_state" in resume_checkpoint:
             optimizer.load_state_dict(resume_checkpoint["optimizer_state"])
             move_optimizer_state_to_device(optimizer, device)
         else:
             print("⚠️ Resume checkpoint is missing optimizer state. Optimizer will restart.")
-
+        #恢复 scheduler 状态
         if "scheduler_state" in resume_checkpoint:
             scheduler.load_state_dict(resume_checkpoint["scheduler_state"])
         else:
@@ -1070,14 +981,12 @@ def main():
                 "⚠️ Resume checkpoint is missing scheduler state. "
                 "Learning-rate schedule will restart from the current script settings."
             )
-
         best_val_loss = resume_checkpoint.get(
             "best_val_loss",
             resume_checkpoint.get("val_loss", float("inf")),
         )
         best_epoch = resume_checkpoint.get("best_epoch")
         start_epoch = max(resume_checkpoint.get("epoch", -1) + 1, 0)
-
         print(
             f"🔁 Restored epoch {resume_checkpoint.get('completed_epoch', start_epoch)} "
             f"and will continue from epoch {start_epoch + 1}/{args.epochs}"
@@ -1087,7 +996,6 @@ def main():
                 f"🏁 Best checkpoint so far: epoch {best_epoch} "
                 f"with valid loss {best_val_loss:.6f}"
             )
-
         if start_epoch >= args.epochs:
             print("✅ Resume checkpoint already reached the requested total epochs. Nothing to do.")
             finish_run(
@@ -1110,7 +1018,6 @@ def main():
         train_grad_norm_total = 0.0
         train_grad_norm_max = 0.0
         train_generator.manual_seed(seed + epoch)
-
         for batch in tqdm(train_loader, desc=f"Epoch {epoch + 1}/{args.epochs} [Train]"):
             optimizer.zero_grad(set_to_none=True)
             with build_autocast_context(device, amp_enabled):
@@ -1119,15 +1026,16 @@ def main():
                     criterion,
                     batch,
                     device,
-                    args.variant,
-                    args.loss_type,
+                    loss_config,
                 )
             scaler.scale(total_loss).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
             grad_norm = compute_gradient_norm(model)
             train_grad_norm_total += grad_norm
             train_grad_norm_max = max(train_grad_norm_max, grad_norm)
+
             scaler.step(optimizer)
             scaler.update()
             update_metric_totals(train_metric_totals, loss_dict)
@@ -1135,6 +1043,7 @@ def main():
         avg_train_metrics = average_metrics(train_metric_totals, len(train_loader))
         avg_train_grad_norm = train_grad_norm_total / len(train_loader)
 
+        #验证阶段：遍历 valid_loader
         model.eval()
         valid_metric_totals = init_metric_totals()
         with torch.no_grad():
@@ -1145,8 +1054,7 @@ def main():
                         criterion,
                         batch,
                         device,
-                        args.variant,
-                        args.loss_type,
+                        loss_config,
                     )
                 update_metric_totals(valid_metric_totals, loss_dict)
 
@@ -1169,12 +1077,12 @@ def main():
             f"Train={avg_train_metrics['loss_total']:.6f} | "
             f"Valid={avg_valid_metrics['loss_total']:.6f}"
         )
-        if uses_geo_loss(args.variant):
+        if loss_config.use_geo:
             log_msg += (
                 f" | TrainGeo={avg_train_metrics['loss_geo']:.6f}"
                 f" | ValidGeo={avg_valid_metrics['loss_geo']:.6f}"
             )
-        if uses_aux_supervision(args.variant):
+        if loss_config.use_aux:
             log_msg += (
                 f" | TrainAux={avg_train_metrics['loss_aux']:.6f}"
                 f" | ValidAux={avg_valid_metrics['loss_aux']:.6f}"

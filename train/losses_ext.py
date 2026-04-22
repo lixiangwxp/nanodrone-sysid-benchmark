@@ -1,4 +1,5 @@
 import math
+from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
@@ -159,4 +160,236 @@ class CompositeAblationLoss(nn.Module):
         return total_loss, loss_dict
 
 
-__all__ = ["DenormRotGeodesicLoss", "CompositeAblationLoss"]
+@dataclass(frozen=True)
+class LossConfig:
+    temporal_loss: str
+    use_geo: bool
+    use_aux: bool
+    use_force: bool
+    beta_geo: float
+    beta_aux: float
+    beta_force: float
+    w_rot: float
+    w_omega: float
+    lambda_mse: float = 0.1
+    aux_loss_type: str = "smooth_l1"
+
+
+def build_loss_config(
+    loss_type,
+    beta_geo,
+    beta_aux,
+    beta_force,
+    w_rot,
+    w_omega,
+    use_geo=False,
+    use_aux=False,
+    use_force=False,
+    lambda_mse=0.1,
+    aux_loss_type="smooth_l1",
+):
+    return LossConfig(
+        temporal_loss=loss_type,
+        use_geo=use_geo,
+        use_aux=use_aux,
+        use_force=use_force,
+        beta_geo=beta_geo,
+        beta_aux=beta_aux,
+        beta_force=beta_force,
+        w_rot=w_rot,
+        w_omega=w_omega,
+        lambda_mse=lambda_mse,
+        aux_loss_type=aux_loss_type,
+    )
+
+
+def compute_mixed_temporal_loss(pred_seq, true_seq, profile="mixed"):
+    window = min(10, pred_seq.shape[1])
+    loss_exp = WeightedMSELoss(lambda_=0.03)(pred_seq, true_seq)
+    loss_uniform = torch.mean((pred_seq - true_seq) ** 2)
+    loss_tail = torch.mean((pred_seq[:, -window:] - true_seq[:, -window:]) ** 2)
+
+    if profile == "mixed":
+        loss_early = loss_exp.detach().new_tensor(0.0)
+        total_loss = 0.5 * loss_exp + 0.3 * loss_uniform + 0.2 * loss_tail
+    elif profile == "mixed_early":
+        loss_early = torch.mean((pred_seq[:, :window] - true_seq[:, :window]) ** 2)
+        total_loss = (
+            0.35 * loss_exp
+            + 0.25 * loss_uniform
+            + 0.20 * loss_tail
+            + 0.20 * loss_early
+        )
+    else:
+        raise ValueError(f"Unsupported mixed temporal loss profile: {profile}")
+
+    zero = total_loss.detach().new_tensor(0.0)
+    loss_dict = {
+        "loss_total": total_loss.detach(),
+        "loss_mse": total_loss.detach(),
+        "loss_geo": zero,
+        "loss_aux": zero,
+        "loss_exp": loss_exp.detach(),
+        "loss_uniform": loss_uniform.detach(),
+        "loss_tail": loss_tail.detach(),
+        "loss_early": loss_early.detach(),
+    }
+    return total_loss, loss_dict
+
+
+class AblationCriterion(nn.Module):
+    def __init__(self, loss_config, x_scaler):
+        super().__init__()
+        self.loss_config = loss_config
+        self.temporal_exp_loss = WeightedMSELoss(lambda_=loss_config.lambda_mse)
+        self.geo_loss = None
+        self.aux_loss = None
+
+        if loss_config.use_geo:
+            if x_scaler is None:
+                raise ValueError("x_scaler is required when use_geo=True")
+            self.register_buffer("x_mean", torch.as_tensor(x_scaler.mean_, dtype=torch.float32))
+            self.register_buffer("x_scale", torch.as_tensor(x_scaler.scale_, dtype=torch.float32))
+            self.geo_loss = WeightedGeodesicLoss(
+                lambda_=loss_config.lambda_mse,
+                w_pos=0.0,
+                w_vel=0.0,
+                w_rot=loss_config.w_rot,
+                w_omega=loss_config.w_omega,
+            )
+
+        if loss_config.use_aux:
+            self.aux_loss = CompositeAblationLoss._build_aux_loss(loss_config.aux_loss_type)
+
+    def denorm(self, x_norm):
+        return x_norm * self.x_scale + self.x_mean
+
+    def _compute_temporal_loss(self, pred_seq_norm, true_seq_norm):
+        if self.loss_config.temporal_loss == "exp":
+            total_loss = self.temporal_exp_loss(pred_seq_norm, true_seq_norm)
+            zero = total_loss.detach().new_tensor(0.0)
+            loss_dict = {
+                "loss_total": total_loss.detach(),
+                "loss_mse": total_loss.detach(),
+                "loss_geo": zero,
+                "loss_aux": zero,
+            }
+            return total_loss, loss_dict
+
+        if self.loss_config.temporal_loss in {"mixed", "mixed_early"}:
+            return compute_mixed_temporal_loss(
+                pred_seq_norm,
+                true_seq_norm,
+                profile=self.loss_config.temporal_loss,
+            )
+
+        raise ValueError(
+            f"Unsupported temporal loss profile: {self.loss_config.temporal_loss}"
+        )
+
+    def forward(self, pred_seq_norm, true_seq_norm, aux_pred=None, aux_true=None):
+        temporal_loss, loss_dict = self._compute_temporal_loss(pred_seq_norm, true_seq_norm)
+        loss_geo = pred_seq_norm.new_tensor(0.0)
+        loss_aux = pred_seq_norm.new_tensor(0.0)
+
+        numerator = temporal_loss
+        denominator = 1.0
+
+        if self.loss_config.use_geo:
+            pred_seq_real = self.denorm(pred_seq_norm)
+            true_seq_real = self.denorm(true_seq_norm)
+            loss_geo = self.geo_loss(pred_seq_real, true_seq_real)
+            numerator = numerator + self.loss_config.beta_geo * loss_geo
+            denominator += self.loss_config.beta_geo
+
+        if self.loss_config.use_aux:
+            if aux_pred is None or aux_true is None:
+                raise ValueError("aux_pred and aux_true are required when use_aux=True")
+            loss_aux = self.aux_loss(aux_pred, aux_true)
+            numerator = numerator + self.loss_config.beta_aux * loss_aux
+            denominator += self.loss_config.beta_aux
+
+        total_loss = numerator / denominator
+        loss_dict["loss_total"] = total_loss.detach()
+        loss_dict["loss_mse"] = temporal_loss.detach()
+        loss_dict["loss_geo"] = loss_geo.detach()
+        loss_dict["loss_aux"] = loss_aux.detach()
+        return total_loss, loss_dict
+
+
+def build_criterion(loss_config, x_scaler):
+    return AblationCriterion(loss_config=loss_config, x_scaler=x_scaler)
+
+
+def _compute_force_loss(model, batch, force_pred_seq, u_eff_seq_real, device, beta_force):
+    if len(batch) < 4:
+        zero = force_pred_seq.detach().new_tensor(0.0)
+        return zero, zero
+
+    aux_seq = batch[3].to(device)
+    if aux_seq.shape[-1] < 3:
+        zero = force_pred_seq.detach().new_tensor(0.0)
+        return zero, zero
+
+    f_meas_body = model.phys.m * aux_seq[..., :3]
+    thrust = model.phys.Kt * (u_eff_seq_real ** 2).sum(dim=-1, keepdim=True)
+    zeros = torch.zeros_like(thrust)
+    f_phys_body = torch.cat([zeros, zeros, thrust], dim=-1)
+    force_target_seq = (f_meas_body - f_phys_body).detach()
+
+    force_loss = torch.nn.functional.smooth_l1_loss(force_pred_seq, force_target_seq)
+    weighted_force_loss = beta_force * force_loss
+    return weighted_force_loss, force_loss.detach()
+
+
+def compute_loss(model, criterion, batch, device, loss_config):
+    x0, u_seq, true_seq = batch[:3]
+    x0 = x0.to(device)
+    u_seq = u_seq.to(device)
+    true_seq = true_seq.to(device)
+    aux_seq = batch[3].to(device) if len(batch) > 3 else None
+
+    aux_pred = None
+    force_pred_seq = None
+    u_eff_seq_real = None
+
+    if loss_config.use_force:
+        pred_seq, force_pred_seq, u_eff_seq_real = model(x0, u_seq, return_force=True)
+    elif loss_config.use_aux:
+        pred_seq, aux_pred = model(x0, u_seq, return_aux=True)
+    else:
+        pred_seq = model(x0, u_seq)
+
+    total_loss, loss_dict = criterion(
+        pred_seq,
+        true_seq,
+        aux_pred=aux_pred,
+        aux_true=aux_seq,
+    )
+
+    if loss_config.use_force:
+        weighted_force_loss, force_loss_value = _compute_force_loss(
+            model=model,
+            batch=batch,
+            force_pred_seq=force_pred_seq,
+            u_eff_seq_real=u_eff_seq_real,
+            device=device,
+            beta_force=loss_config.beta_force,
+        )
+        total_loss = total_loss + weighted_force_loss
+        loss_dict["loss_total"] = total_loss.detach()
+        loss_dict["loss_force"] = force_loss_value
+
+    return total_loss, loss_dict
+
+
+__all__ = [
+    "DenormRotGeodesicLoss",
+    "CompositeAblationLoss",
+    "LossConfig",
+    "build_loss_config",
+    "compute_mixed_temporal_loss",
+    "AblationCriterion",
+    "build_criterion",
+    "compute_loss",
+]

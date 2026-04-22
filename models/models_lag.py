@@ -20,10 +20,11 @@ class MotorLagLayer(nn.Module):
         param_shape = (1,) if lag_mode == "shared" else (4,)
         alpha = torch.full(param_shape, float(alpha_init), dtype=torch.float32)
         self.logit_alpha = nn.Parameter(torch.logit(alpha))
+        #真正参与优化器更新的是 logit_alpha，真正用于物理公式的是 alpha。
 
     @property
     def alpha(self):
-        return torch.sigmoid(self.logit_alpha)
+        return torch.sigmoid(self.logit_alpha)#优化器最擅长更新的是任意实数参数
 
     def forward(self, u_eff_prev, u_raw):
         alpha = self.alpha.view(*([1] * (u_raw.ndim - 1)), -1)
@@ -268,29 +269,29 @@ class LagPhysResGRUModel(LagPhysResQuadModel):
         alpha_init=0.85,
         hidden_dim=64,
     ):
-        nn.Module.__init__(self)#基类初始化
-        if not isinstance(phys, PhysQuadModel):
-            raise TypeError("phys must be an instance of PhysQuadModel")
-        if not isinstance(residual, ResidualQuadModel):
-            raise TypeError("residual must be an instance of ResidualQuadModel")
+        nn.Module.__init__(self)
 
+        # 1) 普通配置 / 非参数属性
         self.phys = phys
         self.residual = residual
         self.dt = phys.dt
         self.use_aux_head = False
         self.aux_dim = 0
         self.aux_head = None
+
+        # 2) 可学习模块：执行器滞后层
         self.lag_layer = MotorLagLayer(lag_mode=lag_mode, alpha_init=alpha_init)
+
+        # 3) 冻结参数：物理主干参与前向，但不参与训练更新
         for param in self.phys.parameters():
             param.requires_grad_(False)
         self.gru_hidden_dim = hidden_dim
-        
+
+        # 4) 维度与结构检查
         state_dim = residual.out.out_features
         #state_dim：与状态/残差同维，12（最后一层Linear输出 12）。
 
         control_dim = 4
-
-
         feature_dim = state_dim + 3 * control_dim + hidden_dim
         self._validate_residual_input(
             state_dim=state_dim,
@@ -298,16 +299,15 @@ class LagPhysResGRUModel(LagPhysResQuadModel):
         )
         #残差网络吃的是 [x_norm, u_raw, u_eff, u_raw-u_eff, h]——和无 GRU 版不同，无 GRU 时没有 h，只有 state_dim + 12。
 
+        # 5) buffer：保存归一化常数，不参与优化器更新
         x_mean, x_scale = self._scaler_to_tensors(x_scaler, state_dim)
         u_mean, u_scale = self._scaler_to_tensors(u_scaler, control_dim)
-
-
-        #保存归一化参数，避免在 forward 中反复计算。
         self.register_buffer("x_mean", x_mean)
         self.register_buffer("x_scale", x_scale)
         self.register_buffer("u_mean", u_mean)
         self.register_buffer("u_scale", u_scale)
 
+        # 6) 可学习模块：GRU 初始化、动态 alpha 头、GRUCell
         self.h_init = nn.Sequential(nn.Linear(state_dim, hidden_dim), nn.Tanh())
         #h，形状 (B, hidden_dim)
 
@@ -332,54 +332,61 @@ class LagPhysResGRUModel(LagPhysResQuadModel):
             dim=-1,
         )
 
-    def forward(self, x0, u_seq, return_force=False):
+    def forward(self, x0, u_seq):
+        # 兼容单步控制输入 (B,4)；统一成时序输入 (B,T,4) 做 rollout。
         if u_seq.ndim == 2:
             u_seq = u_seq.unsqueeze(1)
+        # 兼容 (B,1,12) 与 (B,12) 两种初始状态写法。
         if x0.ndim == 3:
             x_norm = x0.squeeze(1)
         else:
             x_norm = x0
 
-        if x_norm.ndim != 2:
-            raise ValueError("x0 must have shape (B,12) or (B,1,12)")
-        if u_seq.ndim != 3 or u_seq.shape[-1] != 4:
-            raise ValueError("u_seq must have shape (B,T,4) or (B,4)")
-
         _, horizon, _ = u_seq.shape
         preds = []
+        # 从当前状态生成初始记忆 h；执行器内部状态用第一步控制作 seed。
         h = self.h_init(x_norm)
         u_eff_prev_real = self.u_denorm(u_seq[:, 0, :])
 
         for t in range(horizon):
+            '''取当前raw电机指令'''
             u_raw_norm = u_seq[:, t, :]
             u_raw_real = self.u_denorm(u_raw_norm)
 
+            # 先用固定一阶 lag 得到一个 seed，再由 GRU 上下文预测动态 alpha_t。
             u_eff_seed_real = self.lag_layer(u_eff_prev_real, u_raw_real)
             u_eff_seed_norm = self.u_normed(u_eff_seed_real)
             alpha_in = self._pack_gru_features(x_norm, u_raw_norm, u_eff_seed_norm, h)
             alpha_t = torch.sigmoid(self.alpha_head(alpha_in))
 
+            # 最终有效电机转速：在上一时刻执行器状态和当前 raw 指令之间动态插值。
             u_eff_real = alpha_t * u_eff_prev_real + (1.0 - alpha_t) * u_raw_real
             u_eff_norm = self.u_normed(u_eff_real)
 
+            # 物理主干在真实量纲下推进一步，再映回归一化空间。
             x_real = self.x_denorm(x_norm)
             x_phys_next_real = self.physics_step_from_motors(x_real, u_eff_real)
             x_phys_next_norm = self.x_normed(x_phys_next_real)
 
+            # 记忆状态 h 随当前状态、控制和有效执行器输入一起更新。
             gru_in = self._pack_gru_features(x_norm, u_raw_norm, u_eff_norm, h)
             h = self.gru_cell(gru_in, h)
 
+            # 残差网络学习 physics 未覆盖的修正量，再和物理预测相加。
             residual_in = self._pack_gru_features(x_norm, u_raw_norm, u_eff_norm, h)
             dx_res = self.residual.out(self.residual.mlp(residual_in))
             x_next_norm = x_phys_next_norm + dx_res
 
+            # 若残差分支数值炸掉，则退回纯 physics 预测，保证 rollout 可继续。
             finite_mask = torch.isfinite(x_next_norm).all(dim=-1, keepdim=True)
             x_next_norm = torch.where(finite_mask, x_next_norm, x_phys_next_norm)
 
+            # 自回归 rollout：本步输出作为下一步输入继续往前滚。
             preds.append(x_next_norm.unsqueeze(1))
             x_norm = x_next_norm
             u_eff_prev_real = u_eff_real
 
+        # 拼成完整预测序列 (B,T,12)。
         return torch.cat(preds, dim=1)
 
 
