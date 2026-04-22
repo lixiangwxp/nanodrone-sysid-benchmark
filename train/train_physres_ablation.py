@@ -21,6 +21,7 @@ from dataset.dataset import QuadDataset, combine_concat_dataset
 from dataset.dataset_aux import QuadDatasetWithAux, combine_concat_dataset_with_aux
 from models.models import PhysQuadModel, PhysResQuadModel, ResidualQuadModel
 from models.models_lag import (
+    LagPhysResGRUControlModel,
     LagPhysResGRUForceModel,
     LagPhysResGRUModel,
     LagPhysResGRUTorqueModel,
@@ -42,7 +43,7 @@ from utils.wandb_utils import (
 )
 
 
-VARIANT_CHOICES = ["baseline", "geo", "lag", "lag_gru", "lag_gru_torque", "lag_gru_force", "lag_geo", "full"]
+VARIANT_CHOICES = ["baseline", "geo", "lag", "lag_gru", "lag_gru_ctrl", "lag_gru_torque", "lag_gru_force", "lag_geo", "full"]
 DEFAULT_AUX_COLS_RAW = '["az_body"]'
 DEFAULT_FORCE_AUX_COLS = ["ax_body", "ay_body", "az_body"]
 
@@ -57,7 +58,7 @@ def parse_json_list(raw_value, arg_name):
 
 
 def uses_lag(variant):
-    return variant in {"lag", "lag_gru", "lag_gru_torque", "lag_gru_force", "lag_geo", "full"}
+    return variant in {"lag", "lag_gru", "lag_gru_ctrl", "lag_gru_torque", "lag_gru_force", "lag_geo", "full"}
 
 
 def uses_geo_loss(variant):
@@ -132,9 +133,10 @@ def build_model(
     hidden_dim,
     gru_hidden_dim,
     torque_scale_factor,
+    control_ctx_dim,
 ):
     num_layers = 5
-    if variant in {"lag_gru", "lag_gru_torque", "lag_gru_force"}:
+    if variant in {"lag_gru", "lag_gru_ctrl", "lag_gru_torque", "lag_gru_force"}:
         residual_input_dim = gru_hidden_dim + 12
         #对 lag_gru 相关的模型，残差网络看的是：GRU 隐状态（gru_hidden_dim维）和原始控制相关的12维量（u_raw：4维，u_eff：4维，u_raw - u_eff：4维），合起来就是 gru_hidden_dim + 12 维
         #GRU 隐状态 h 可以理解成一个“学出来的记忆向量”，
@@ -167,6 +169,17 @@ def build_model(
             lag_mode=lag_mode,
             alpha_init=alpha_init,
             hidden_dim=gru_hidden_dim,
+        )
+    elif variant == "lag_gru_ctrl":
+        model = LagPhysResGRUControlModel(
+            phys=phys_model,
+            residual=residual_model,
+            x_scaler=x_scaler,
+            u_scaler=u_scaler,
+            lag_mode=lag_mode,
+            alpha_init=alpha_init,
+            hidden_dim=gru_hidden_dim,
+            control_ctx_dim=control_ctx_dim,
         )
     elif variant == "lag_gru_torque":
         model = LagPhysResGRUTorqueModel(
@@ -248,7 +261,7 @@ def build_autocast_context(device, enabled):
 #配置怎么更新参数
 def build_optimizer(model, variant, base_lr):
     weight_decay = 1e-5
-    if variant not in {"lag_gru", "lag_gru_torque", "lag_gru_force"}:
+    if variant not in {"lag_gru", "lag_gru_ctrl", "lag_gru_torque", "lag_gru_force"}:
         return optim.Adam(model.parameters(), lr=base_lr, weight_decay=weight_decay)
 
     grouped_ids = set()
@@ -271,6 +284,9 @@ def build_optimizer(model, variant, base_lr):
 
     #“中等学习率”的参数组
     medium_params = collect_params(getattr(model, "gru_cell", None))
+    medium_params.extend(collect_params(getattr(model, "control_encoder", None)))
+    medium_params.extend(collect_params(getattr(model, "ctx_h0_adapter", None)))
+    medium_params.extend(collect_params(getattr(model, "ctx_step_adapter", None)))
     medium_params.extend(collect_params(getattr(model, "torque_head", None)))
     medium_params.extend(collect_params(getattr(model, "force_head", None)))
     medium_params.extend(collect_params(getattr(model, "residual", None)))
@@ -329,6 +345,7 @@ def build_checkpoint(
     gru_hidden_dim,
     loss_type,
     torque_scale_factor,
+    control_ctx_dim,
     init_from,
     freeze_non_torque,
     amp_enabled,
@@ -367,10 +384,11 @@ def build_checkpoint(
             "lr_end": lr_end,
             "batch_size": batch_size,
             "gru_hidden_dim": (
-                gru_hidden_dim if variant in {"lag_gru", "lag_gru_torque", "lag_gru_force"} else None
+                gru_hidden_dim if variant in {"lag_gru", "lag_gru_ctrl", "lag_gru_torque", "lag_gru_force"} else None
             ),
             "loss_type": loss_type,
             "torque_scale_factor": torque_scale_factor,
+            "control_ctx_dim": control_ctx_dim,
             "init_from": init_from,
             "freeze_non_torque": freeze_non_torque,
             "amp": amp_enabled,
@@ -525,8 +543,16 @@ def validate_resume_checkpoint(checkpoint, args, train_trajs, valid_trajs, aux_c
         expected_pairs.append(("lr_end", args.lr_end, config.get("lr_end")))
     if config.get("hidden_dim") is not None:
         expected_pairs.append(("hidden_dim", args.hidden_dim, config.get("hidden_dim")))
-    if args.variant in {"lag_gru", "lag_gru_torque", "lag_gru_force"} and config.get("gru_hidden_dim") is not None:
+    if args.variant in {"lag_gru", "lag_gru_ctrl", "lag_gru_torque", "lag_gru_force"} and config.get("gru_hidden_dim") is not None:
         expected_pairs.append(("gru_hidden_dim", args.gru_hidden_dim, config.get("gru_hidden_dim")))
+    if args.variant == "lag_gru_ctrl":
+        expected_pairs.append(
+            (
+                "control_ctx_dim",
+                args.control_ctx_dim,
+                config.get("control_ctx_dim", 32),
+            )
+        )
     if args.variant == "lag_gru_torque":
         expected_pairs.append(
             (
@@ -610,6 +636,12 @@ def main():
     parser.add_argument("--w_omega", type=float, default=2.0)
     parser.add_argument("--lag_mode", type=str, default="per_motor", choices=["shared", "per_motor"])
     parser.add_argument("--alpha_init", type=float, default=0.85)
+    parser.add_argument(
+        "--control-ctx-dim",
+        type=int,
+        default=32,
+        help="Control context dimension for lag_gru_ctrl.",
+    )
     parser.add_argument(
         "--torque-scale-factor",
         type=float,
@@ -891,6 +923,7 @@ def main():
         hidden_dim=args.hidden_dim,
         gru_hidden_dim=args.gru_hidden_dim,
         torque_scale_factor=args.torque_scale_factor,
+        control_ctx_dim=args.control_ctx_dim,
         )#准备物理模型常数。
     model = model.to(device)
     resolved_init_from = None
@@ -949,6 +982,7 @@ def main():
             "phys_params": phys_params,
             "lr_start": lr_start,
             "lr_end": lr_end,
+            "control_ctx_dim": args.control_ctx_dim,
             "resolved_init_from": resolved_init_from,
         },
         tags=["physres-ablation", args.variant, *train_trajs],
@@ -1160,6 +1194,7 @@ def main():
             gru_hidden_dim=args.gru_hidden_dim,
             loss_type=args.loss_type,
             torque_scale_factor=args.torque_scale_factor,
+            control_ctx_dim=args.control_ctx_dim,
             init_from=resolved_init_from,
             freeze_non_torque=args.freeze_non_torque,
             amp_enabled=amp_enabled,

@@ -2,6 +2,7 @@ import math
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from models.models import PhysQuadModel, ResidualQuadModel
 
@@ -29,6 +30,61 @@ class MotorLagLayer(nn.Module):
     def forward(self, u_eff_prev, u_raw):
         alpha = self.alpha.view(*([1] * (u_raw.ndim - 1)), -1)
         return alpha * u_eff_prev + (1.0 - alpha) * u_raw
+
+
+class ControlTCNEncoder(nn.Module):
+    """Encode the full known future control sequence into stepwise and global context."""
+
+    def __init__(self, ctx_dim=32, kernel_size=3, dilations=(1, 2, 4)):
+        super().__init__()
+        self.ctx_dim = int(ctx_dim)
+        self.kernel_size = int(kernel_size)
+        self.dilations = tuple(int(dilation) for dilation in dilations)
+
+        convs = []
+        in_channels = 8
+        for dilation in self.dilations:
+            convs.append(
+                nn.Conv1d(
+                    in_channels,
+                    self.ctx_dim,
+                    kernel_size=self.kernel_size,
+                    dilation=dilation,
+                )
+            )
+            in_channels = self.ctx_dim
+        self.convs = nn.ModuleList(convs)
+
+        squeeze_dim = max(4, self.ctx_dim // 4)
+        self.channel_gate = nn.Sequential(
+            nn.Linear(self.ctx_dim, squeeze_dim),
+            nn.ReLU(),
+            nn.Linear(squeeze_dim, self.ctx_dim),
+            nn.Sigmoid(),
+        )
+
+    def _causal_conv(self, x, conv):
+        left_pad = (conv.kernel_size[0] - 1) * conv.dilation[0]
+        x = F.pad(x, (left_pad, 0))
+        return conv(x)
+
+    def forward(self, u_seq_norm):
+        if u_seq_norm.ndim != 3 or u_seq_norm.shape[-1] != 4:
+            raise ValueError("u_seq_norm must have shape (B,T,4)")
+
+        du_seq = torch.zeros_like(u_seq_norm)
+        du_seq[:, 1:, :] = u_seq_norm[:, 1:, :] - u_seq_norm[:, :-1, :]
+        features = torch.cat([u_seq_norm, du_seq], dim=-1).transpose(1, 2)
+
+        hidden = features
+        for conv in self.convs:
+            hidden = torch.relu(self._causal_conv(hidden, conv))
+
+        channel_gate = self.channel_gate(hidden.mean(dim=-1)).unsqueeze(-1)
+        hidden = hidden * channel_gate
+        c_seq = hidden.transpose(1, 2)
+        c_global = hidden.mean(dim=-1)
+        return c_seq, c_global
 
 #在「物理模型 + 残差网络」的基础上，多了一层「电机指令→等效转速」的一阶滞后，并沿时间一步步 roll 出整段预测。
 class LagPhysResQuadModel(nn.Module):
@@ -390,6 +446,94 @@ class LagPhysResGRUModel(LagPhysResQuadModel):
         return torch.cat(preds, dim=1)
 
 
+class LagPhysResGRUControlModel(LagPhysResGRUModel):
+    """Lag-GRU with a lightweight future-control context encoder."""
+
+    def __init__(
+        self,
+        phys,
+        residual,
+        x_scaler,
+        u_scaler,
+        lag_mode="per_motor",
+        alpha_init=0.85,
+        hidden_dim=64,
+        control_ctx_dim=32,
+    ):
+        super().__init__(
+            phys=phys,
+            residual=residual,
+            x_scaler=x_scaler,
+            u_scaler=u_scaler,
+            lag_mode=lag_mode,
+            alpha_init=alpha_init,
+            hidden_dim=hidden_dim,
+        )
+        self.control_ctx_dim = int(control_ctx_dim)
+        self.control_encoder = ControlTCNEncoder(ctx_dim=self.control_ctx_dim)
+        self.ctx_h0_adapter = nn.Linear(self.control_ctx_dim, hidden_dim)
+        self.ctx_step_adapter = nn.Linear(self.control_ctx_dim, hidden_dim)
+        nn.init.zeros_(self.ctx_h0_adapter.weight)
+        nn.init.zeros_(self.ctx_h0_adapter.bias)
+        nn.init.zeros_(self.ctx_step_adapter.weight)
+        nn.init.zeros_(self.ctx_step_adapter.bias)
+
+    def forward(self, x0, u_seq):
+        if u_seq.ndim == 2:
+            u_seq = u_seq.unsqueeze(1)
+        if x0.ndim == 3:
+            x_norm = x0.squeeze(1)
+        else:
+            x_norm = x0
+
+        if x_norm.ndim != 2:
+            raise ValueError("x0 must have shape (B,12) or (B,1,12)")
+        if u_seq.ndim != 3 or u_seq.shape[-1] != 4:
+            raise ValueError("u_seq must have shape (B,T,4) or (B,4)")
+
+        _, horizon, _ = u_seq.shape
+        preds = []
+        c_seq, c_global = self.control_encoder(u_seq)
+        h = self.h_init(x_norm)
+        h = h + self.ctx_h0_adapter(c_global)
+        u_eff_prev_real = self.u_denorm(u_seq[:, 0, :])
+
+        for t in range(horizon):
+            u_raw_norm = u_seq[:, t, :]
+            u_raw_real = self.u_denorm(u_raw_norm)
+            c_t = c_seq[:, t, :]
+
+            u_eff_seed_real = self.lag_layer(u_eff_prev_real, u_raw_real)
+            u_eff_seed_norm = self.u_normed(u_eff_seed_real)
+            h_alpha = h + self.ctx_step_adapter(c_t)
+            alpha_in = self._pack_gru_features(x_norm, u_raw_norm, u_eff_seed_norm, h_alpha)
+            alpha_t = torch.sigmoid(self.alpha_head(alpha_in))
+
+            u_eff_real = alpha_t * u_eff_prev_real + (1.0 - alpha_t) * u_raw_real
+            u_eff_norm = self.u_normed(u_eff_real)
+
+            x_real = self.x_denorm(x_norm)
+            x_phys_next_real = self.physics_step_from_motors(x_real, u_eff_real)
+            x_phys_next_norm = self.x_normed(x_phys_next_real)
+
+            gru_in = self._pack_gru_features(x_norm, u_raw_norm, u_eff_norm, h)
+            h = self.gru_cell(gru_in, h)
+
+            h_res = h + self.ctx_step_adapter(c_t)
+            residual_in = self._pack_gru_features(x_norm, u_raw_norm, u_eff_norm, h_res)
+            dx_res = self.residual.out(self.residual.mlp(residual_in))
+            x_next_norm = x_phys_next_norm + dx_res
+
+            finite_mask = torch.isfinite(x_next_norm).all(dim=-1, keepdim=True)
+            x_next_norm = torch.where(finite_mask, x_next_norm, x_phys_next_norm)
+
+            preds.append(x_next_norm.unsqueeze(1))
+            x_norm = x_next_norm
+            u_eff_prev_real = u_eff_real
+
+        return torch.cat(preds, dim=1)
+
+
 class LagPhysResGRUTorqueModel(LagPhysResGRUModel):
     """GRU-conditioned lag model with learned residual body torque."""
 
@@ -616,8 +760,10 @@ class LagPhysResGRUForceModel(LagPhysResGRUModel):
 
 __all__ = [
     "MotorLagLayer",
+    "ControlTCNEncoder",
     "LagPhysResQuadModel",
     "LagPhysResGRUModel",
+    "LagPhysResGRUControlModel",
     "LagPhysResGRUTorqueModel",
     "LagPhysResGRUForceModel",
 ]
