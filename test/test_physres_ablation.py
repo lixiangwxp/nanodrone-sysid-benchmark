@@ -118,6 +118,7 @@ def rebuild_model(checkpoint, x_scaler, u_scaler, device):
             lag_mode=config.get("lag_mode", "per_motor"),
             alpha_init=config.get("alpha_init", 0.85),
             hidden_dim=gru_hidden_dim,
+            torque_scale_factor=config.get("torque_scale_factor", 0.2),
         ).to(device)
     elif variant == "lag_gru_force":
         model = LagPhysResGRUForceModel(

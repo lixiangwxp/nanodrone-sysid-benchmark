@@ -395,6 +395,7 @@ class LagPhysResGRUTorqueModel(LagPhysResGRUModel):
         lag_mode="per_motor",
         alpha_init=0.85,
         hidden_dim=64,
+        torque_scale_factor: float = 0.2,
     ):
         super().__init__(
             phys=phys,
@@ -405,6 +406,7 @@ class LagPhysResGRUTorqueModel(LagPhysResGRUModel):
             alpha_init=alpha_init,
             hidden_dim=hidden_dim,
         )
+        self.torque_scale_factor = float(torque_scale_factor)
 
         self.torque_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
@@ -415,7 +417,7 @@ class LagPhysResGRUTorqueModel(LagPhysResGRUModel):
         nn.init.zeros_(self.torque_head[-1].bias)
         self.register_buffer(
             "torque_scale",
-            0.2 * self.phys.max_torque.detach().clone().view(1, 3),
+            self.torque_scale_factor * self.phys.max_torque.detach().clone().view(1, 3),
         )
 
     def forward(self, x0, u_seq, return_torque: bool = False):

@@ -148,6 +148,7 @@ def build_model(
     aux_dim,
     hidden_dim,
     gru_hidden_dim,
+    torque_scale_factor,
 ):
     num_layers = 5
     if variant in {"lag_gru", "lag_gru_torque", "lag_gru_force"}:
@@ -184,6 +185,7 @@ def build_model(
             lag_mode=lag_mode,
             alpha_init=alpha_init,
             hidden_dim=gru_hidden_dim,
+            torque_scale_factor=torque_scale_factor,
         )
     elif variant == "lag_gru_force":
         model = LagPhysResGRUForceModel(
@@ -448,6 +450,9 @@ def build_checkpoint(
     batch_size,
     gru_hidden_dim,
     loss_type,
+    torque_scale_factor,
+    init_from,
+    freeze_non_torque,
     amp_enabled,
     scaler_dir,
     train_trajs,
@@ -487,6 +492,9 @@ def build_checkpoint(
                 gru_hidden_dim if variant in {"lag_gru", "lag_gru_torque", "lag_gru_force"} else None
             ),
             "loss_type": loss_type,
+            "torque_scale_factor": torque_scale_factor,
+            "init_from": init_from,
+            "freeze_non_torque": freeze_non_torque,
             "amp": amp_enabled,
             "seed": seed,
             "name_suffix": name_suffix,
@@ -531,6 +539,36 @@ def move_optimizer_state_to_device(optimizer, device):
         for key, value in state.items():
             if isinstance(value, torch.Tensor):
                 state[key] = value.to(device)
+
+
+def load_init_weights(model, raw_path):
+    init_from_path = Path(raw_path).expanduser()
+    if not init_from_path.exists():
+        raise FileNotFoundError(f"❌ Initialization checkpoint not found: {init_from_path}")
+
+    init_payload = torch.load(init_from_path, map_location="cpu")
+    init_state = (
+        init_payload["model_state"]
+        if isinstance(init_payload, dict) and "model_state" in init_payload
+        else init_payload
+    )
+    load_result = model.load_state_dict(init_state, strict=False)
+    resolved_path = str(init_from_path.resolve())
+    print(f"🔁 Initialized model weights from: {resolved_path}")
+    print(f"   missing_keys: {load_result.missing_keys}")
+    print(f"   unexpected_keys: {load_result.unexpected_keys}")
+    return resolved_path
+
+
+def freeze_non_torque_parameters(model):
+    for name, param in model.named_parameters():
+        param.requires_grad_(name.startswith("torque_head"))
+
+
+def count_parameters(model):
+    total_params = sum(param.numel() for param in model.parameters())
+    trainable_params = sum(param.numel() for param in model.parameters() if param.requires_grad)
+    return trainable_params, total_params
 
 
 def resolve_checkpoint_path(raw_path, model_dir, model_name):
@@ -600,6 +638,21 @@ def validate_resume_checkpoint(checkpoint, args, train_trajs, valid_trajs, aux_c
         expected_pairs.append(("hidden_dim", args.hidden_dim, config.get("hidden_dim")))
     if args.variant in {"lag_gru", "lag_gru_torque", "lag_gru_force"} and config.get("gru_hidden_dim") is not None:
         expected_pairs.append(("gru_hidden_dim", args.gru_hidden_dim, config.get("gru_hidden_dim")))
+    if args.variant == "lag_gru_torque":
+        expected_pairs.append(
+            (
+                "torque_scale_factor",
+                args.torque_scale_factor,
+                config.get("torque_scale_factor", 0.2),
+            )
+        )
+        expected_pairs.append(
+            (
+                "freeze_non_torque",
+                args.freeze_non_torque,
+                config.get("freeze_non_torque", False),
+            )
+        )
 
     if config.get("beta_geo") is not None:
         expected_pairs.append(("beta_geo", args.beta_geo, config.get("beta_geo")))
@@ -668,6 +721,24 @@ def main():
     parser.add_argument("--w_omega", type=float, default=2.0)
     parser.add_argument("--lag_mode", type=str, default="per_motor", choices=["shared", "per_motor"])
     parser.add_argument("--alpha_init", type=float, default=0.85)
+    parser.add_argument(
+        "--torque-scale-factor",
+        type=float,
+        default=0.2,
+        help="Scale factor for lag_gru_torque residual torque, multiplied by phys.max_torque.",
+    )
+    parser.add_argument(
+        "--init-from",
+        type=str,
+        default=None,
+        help="Optional checkpoint path used only to partially initialize model weights before training.",
+    )
+    parser.add_argument(
+        "--freeze-non-torque",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="For lag_gru_torque only: freeze all parameters except torque_head.",
+    )
     parser.add_argument("--aux_cols", type=str, default='["az_body"]')
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument(
@@ -693,6 +764,11 @@ def main():
     parser.add_argument("--scaler_root", type=str, default=str(PROJECT_ROOT / "scalers"))
     add_wandb_args(parser)
     args = parser.parse_args()
+
+    if args.init_from is not None and args.resume_path is not None:
+        raise ValueError("--init-from cannot be used together with --resume_path.")
+    if args.freeze_non_torque and args.variant != "lag_gru_torque":
+        raise ValueError("--freeze-non-torque is only supported for --variant lag_gru_torque.")
 
     if uses_force_supervision(args.variant) and args.loss_type == "exp":
         print("⚠️ lag_gru_force uses a mixed temporal loss profile. Overriding --loss-type to 'mixed'.")
@@ -894,12 +970,19 @@ def main():
         aux_dim=aux_dim,
         hidden_dim=args.hidden_dim,
         gru_hidden_dim=args.gru_hidden_dim,
+        torque_scale_factor=args.torque_scale_factor,
     )
     model = model.to(device)
     model.beta_force = args.beta_force
+    resolved_init_from = None
+    if args.init_from is not None:
+        resolved_init_from = load_init_weights(model, args.init_from)
+    if args.freeze_non_torque:
+        freeze_non_torque_parameters(model)
+        print("🔒 freeze_non_torque enabled: training torque_head parameters only.")
     print(f"🧩 Initialized model variant: {args.variant}")
-    num_trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Total trainable parameters: {num_trainable_params:,}")
+    num_trainable_params, num_total_params = count_parameters(model)
+    print(f"Trainable parameters: {num_trainable_params:,} / {num_total_params:,}")
 
     criterion = build_criterion(
         variant=args.variant,
@@ -952,6 +1035,7 @@ def main():
             "lr_start": lr_start,
             "lr_end": lr_end,
             "amp": amp_enabled,
+            "resolved_init_from": resolved_init_from,
         },
         tags=["physres-ablation", args.variant, *train_trajs],
         group=f"physres_ablation__{'_'.join(train_trajs)}",
@@ -1167,6 +1251,9 @@ def main():
             batch_size=batch_size,
             gru_hidden_dim=args.gru_hidden_dim,
             loss_type=args.loss_type,
+            torque_scale_factor=args.torque_scale_factor,
+            init_from=resolved_init_from,
+            freeze_non_torque=args.freeze_non_torque,
             amp_enabled=amp_enabled,
             scaler_dir=scaler_dir,
             train_trajs=train_trajs,
