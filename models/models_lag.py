@@ -90,7 +90,6 @@ class ControlTCNEncoder(nn.Module):
 class LagPhysResQuadModel(nn.Module):
     """
     Physics + residual model with actuator lag memory.
-
     Inputs are expected in normalized space:
       x_norm: [pos(3), vel(3), so3_log(3), omega(3)]
       u_norm: raw motor angular speeds
@@ -116,6 +115,7 @@ class LagPhysResQuadModel(nn.Module):
         if not isinstance(residual, ResidualQuadModel):
             raise TypeError("residual must be an instance of ResidualQuadModel")
 
+   
         self.phys = phys
         self.residual = residual
         self.dt = phys.dt
@@ -123,15 +123,18 @@ class LagPhysResQuadModel(nn.Module):
         self.aux_dim = aux_dim
         self.lag_layer = MotorLagLayer(lag_mode=lag_mode, alpha_init=alpha_init)
         for param in self.phys.parameters():
-            param.requires_grad_(False)
+            param.requires_grad_(False)#把物理主干self.phys冻结。
 
-        state_dim = residual.out.out_features
-        control_dim = 4
-        self._validate_residual_input(state_dim=state_dim, control_feat_dim=12)
+        state_dim = residual.out.out_features#残差网络输出维度
+        control_dim = 4#4个电机
+        self._validate_residual_input(state_dim=state_dim, control_feat_dim=12)#检查维度对吗
 
+
+        '''把 sklearn scaler 里的均值和标准差拿出来，转成 PyTorch tensor。'''
         x_mean, x_scale = self._scaler_to_tensors(x_scaler, state_dim)
         u_mean, u_scale = self._scaler_to_tensors(u_scaler, control_dim)
 
+        '''buffer 的意思是：这些张量属于模型，但不是可训练参数。'''
         self.register_buffer("x_mean", x_mean)
         self.register_buffer("x_scale", x_scale)
         self.register_buffer("u_mean", u_mean)
@@ -147,6 +150,7 @@ class LagPhysResQuadModel(nn.Module):
             self.aux_head = None
 
     @staticmethod
+    # 处理 scaler
     def _scaler_to_tensors(scaler, dim):
         if scaler is None:
             mean = torch.zeros(dim, dtype=torch.float32)
@@ -157,15 +161,13 @@ class LagPhysResQuadModel(nn.Module):
         scale = torch.as_tensor(scaler.scale_, dtype=torch.float32)
         return mean, scale
 
+    #检查residual网络维度
     def _validate_residual_input(self, state_dim, control_feat_dim):
         first_linear = None
         for layer in self.residual.mlp:
             if isinstance(layer, nn.Linear):
                 first_linear = layer
                 break
-
-        if first_linear is None:
-            raise ValueError("Residual model MLP must contain at least one Linear layer")
 
         expected_in_dim = state_dim + control_feat_dim
         if first_linear.in_features != expected_in_dim:
@@ -175,22 +177,23 @@ class LagPhysResQuadModel(nn.Module):
                 f"got {first_linear.in_features}."
             )
 
+    #暴露 lag 系数
     @property
     def alpha(self):
         return self.lag_layer.alpha
 
+    #归一化/反归一化
     def x_denorm(self, x_norm):
         return x_norm * self.x_scale + self.x_mean
-
     def x_normed(self, x_real):
         return (x_real - self.x_mean) / self.x_scale
-
     def u_denorm(self, u_norm):
         return u_norm * self.u_scale + self.u_mean
-
     def u_normed(self, u_real):
         return (u_real - self.u_mean) / self.u_scale
 
+    
+    #电机转速映射到物理输入,变成 physics 可用的推力/力矩输入
     def motor_to_phys_diff(self, u_mot):
         """Differentiable motor-speed to normalized thrust / torque map."""
         omega2 = u_mot ** 2
@@ -208,7 +211,10 @@ class LagPhysResQuadModel(nn.Module):
         T_norm = T / self.phys.T_max
         tau_norm = torch.stack([tau_x, tau_y, tau_z], dim=1) / self.phys.max_torque
         return torch.cat([T_norm.unsqueeze(1), tau_norm], dim=1)
-    #
+    
+
+
+    #输入是12维真实状态x_real和真实电机转速u_eff_real，输出是“经过physics推进一步之后”的下一个 12 维真实状态。
     def physics_step_from_motors(self, x_real, u_eff_real):
         """Run one physics step from motor speeds while staying in the 12D state space.
         p, v, r(so3_log), ω，其中姿态在接口上是 3 维，内部临时换成 quaternion 做积分。
@@ -234,10 +240,10 @@ class LagPhysResQuadModel(nn.Module):
         return torch.cat([pos_next, vel_next, so3_next, omega_next], dim=-1)
 
 
-#输入：x0：初始状态，归一化，形状 (B,12) 或 (B,1,12)。
-#u_seq：电机角速度序列，归一化，(B,T,4) 或 (B,4)（后者会先变成单步 (B,1,4)）。
-#输出：pred_seq：(B,T,12)，每一步预测后的归一化状态。
-#若 return_aux=True 且建了 aux_head，还会返回 aux_pred_seq。
+    #输入：x0：初始状态，归一化，形状 (B,12) 或 (B,1,12)。
+    #u_seq：电机角速度序列，归一化，(B,T,4) 或 (B,4)（后者会先变成单步 (B,1,4)）。
+    #输出：pred_seq：(B,T,12)，每一步预测后的归一化状态。
+    #若 return_aux=True 且建了 aux_head，还会返回 aux_pred_seq。
     def forward(self, x0, u_seq, return_aux=False):
         if u_seq.ndim == 2:
             u_seq = u_seq.unsqueeze(1)#(B,4) -> (B,1,4)
@@ -245,46 +251,40 @@ class LagPhysResQuadModel(nn.Module):
             x_norm = x0.squeeze(1)#(B,1,12) -> (B,12)
         else:
             x_norm = x0#(B,12)
+        
 
-        if x_norm.ndim != 2:
-            #保证 x 是二维
-            raise ValueError("x0 must have shape (B,12) or (B,1,12)")
-        if u_seq.ndim != 3 or u_seq.shape[-1] != 4:
-            #保证 u_seq 是 3 维且最后一维是 4 路电机
-            raise ValueError("u_seq must have shape (B,T,4) or (B,4)")
-
+        #初始化 rollout 容器
         _, horizon, _ = u_seq.shape
         preds = []
         aux_preds = [] if (return_aux and self.use_aux_head) else None
-
         u_eff_prev_real = self.u_denorm(u_seq[:, 0, :])
+        #因为lag模型每一步都需要“上一时刻的有效转速”，所以第一步先拿第一个控制输入反归一化后当 seed。
 
+
+        #时间循环才是核心
         for t in range(horizon):
-            #当前指令 + 滞后 → 等效转速
+            #取当前控制并反归一化
             u_raw_norm = u_seq[:, t, :]
             u_raw_real = self.u_denorm(u_raw_norm)
             #等效转速 = 当前转速 + 上一步等效
             u_eff_real = self.lag_layer(u_eff_prev_real, u_raw_real)
-
+            # physics 推进一步
             x_real = self.x_denorm(x_norm)
-            # Keep gradients through the learned effective motor speeds while phys params stay frozen.
             x_phys_next_real = self.physics_step_from_motors(x_real, u_eff_real)
             x_phys_next_norm = self.x_normed(x_phys_next_real)
-
+            #构造 residual 网络输入，#输入给 MLP 的特征：x 和 u 的差异。12+12=24
             u_eff_norm = self.u_normed(u_eff_real)
             feat_u = torch.cat(
                 [u_raw_norm, u_eff_norm, u_raw_norm - u_eff_norm],
                 dim=-1,
             )
-            #输入给 MLP 的特征：x 和 u 的差异。12+12=24
             residual_in = torch.cat([x_norm, feat_u], dim=-1)
 
-            #与状态同维 12，加在物理预测的归一化状态上，补齐模型误差。
+            #残差修正，与状态同维 12，加在物理预测的归一化状态上，补齐模型误差。
             dx_res = self.residual.out(self.residual.mlp(residual_in))
-
-            #残差预测 + 物理预测，「p, v, so3_log(r), ω」
             x_next_norm = x_phys_next_norm + dx_res
-
+            
+            #做数值保护并更新下一步输入
             finite_mask = torch.isfinite(x_next_norm).all(dim=-1, keepdim=True)
             x_next_norm = torch.where(finite_mask, x_next_norm, x_phys_next_norm)
 
@@ -294,23 +294,23 @@ class LagPhysResQuadModel(nn.Module):
                 aux_preds.append(self.aux_head(residual_in).unsqueeze(1))
 
             x_norm = x_next_norm
+         
             u_eff_prev_real = u_eff_real
 
+        #循环结束后返回整段轨迹
         pred_seq = torch.cat(preds, dim=1)
 
         if not return_aux:
             return pred_seq
-
         if aux_preds is None:
             return pred_seq, None
-
         aux_pred_seq = torch.cat(aux_preds, dim=1)
         return pred_seq, aux_pred_seq
 
 
 class LagPhysResGRUModel(LagPhysResQuadModel):
     """Physics + residual model with GRU-conditioned dynamic actuator lag.
-    这一步改动旨在引入一个简单的循环模块和动态滞后机制，而不改变物理模型和残差 MLP 的核心结构。
+引入一个简单的循环模块和动态滞后机制，而不改变物理模型和残差 MLP 的核心结构。
     通过 GRUCell 维护一个隐藏状态 h_t,模型可以记忆先前步长的信息；
     通过 alpha_head 动态生成滞后系数a,使执行器的惯性更贴合不同状态；
     然后残差 MLP 的输入由 [x_norm, u_raw_norm, u_eff_norm, h_t] 组成，可以利用记忆修正长期偏差。
@@ -337,6 +337,8 @@ class LagPhysResGRUModel(LagPhysResQuadModel):
 
         # 2) 可学习模块：执行器滞后层
         self.lag_layer = MotorLagLayer(lag_mode=lag_mode, alpha_init=alpha_init)
+        #  可学习模块：GRU 初始化、动态 alpha 头、GRUCell
+        self.h_init = nn.Sequential(nn.Linear(state_dim, hidden_dim), nn.Tanh())
 
         # 3) 冻结参数：物理主干参与前向，但不参与训练更新
         for param in self.phys.parameters():
@@ -363,21 +365,20 @@ class LagPhysResGRUModel(LagPhysResQuadModel):
         self.register_buffer("u_mean", u_mean)
         self.register_buffer("u_scale", u_scale)
 
-        # 6) 可学习模块：GRU 初始化、动态 alpha 头、GRUCell
-        self.h_init = nn.Sequential(nn.Linear(state_dim, hidden_dim), nn.Tanh())
+        
         #h，形状 (B, hidden_dim)
-
         #由当前状态、指令、滞后 seed、GRU 记忆共同决定这一步的混合系数。
         self.alpha_head = nn.Sequential(
             nn.Linear(feature_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, 1),
         )
-        nn.init.zeros_(self.alpha_head[-1].weight)
+        nn.init.zeros_(self.alpha_head[-1].weight)#训练刚开始时，alpha_head 基本会输出接近 alpha_init 的常数。
         nn.init.constant_(self.alpha_head[-1].bias, math.log(alpha_init / (1.0 - alpha_init)))
-        self.gru_cell = nn.GRUCell(feature_dim, hidden_dim)
-        #h是可变的、有记忆的中间向量：每一步都会根据当前输入gru_in和上一步的h更新一次。
+        self.gru_cell = nn.GRUCell(feature_dim, hidden_dim)#h是可变的、有记忆的中间向量：每一步都会根据当前输入gru_in和上一步的h更新一次。
 
+
+    #打包特征给其他地方用
     @staticmethod
     def _pack_gru_features(x_norm, u_raw_norm, u_eff_norm, h):
         #输入：x_norm, u_raw_norm, u_eff_norm, h
@@ -387,6 +388,9 @@ class LagPhysResGRUModel(LagPhysResQuadModel):
             [x_norm, u_raw_norm, u_eff_norm, u_raw_norm - u_eff_norm, h],
             dim=-1,
         )
+
+
+
 
     def forward(self, x0, u_seq):
         # 兼容单步控制输入 (B,4)；统一成时序输入 (B,T,4) 做 rollout。
@@ -400,16 +404,16 @@ class LagPhysResGRUModel(LagPhysResQuadModel):
 
         _, horizon, _ = u_seq.shape
         preds = []
-        # 从当前状态生成初始记忆 h；执行器内部状态用第一步控制作 seed。
+        # 从当前状态生成初始记忆h；执行器内部状态用第一步控制作seed。
         h = self.h_init(x_norm)
         u_eff_prev_real = self.u_denorm(u_seq[:, 0, :])
 
         for t in range(horizon):
-            '''取当前raw电机指令'''
+            '''1取当前raw电机指令'''
             u_raw_norm = u_seq[:, t, :]
             u_raw_real = self.u_denorm(u_raw_norm)
 
-            # 先用固定一阶 lag 得到一个 seed，再由 GRU 上下文预测动态 alpha_t。
+            # 先用固定一阶lag得到一个seed（先用老办法算一个u_eff_seed），再由GRU上下文预测动态alpha_t。
             u_eff_seed_real = self.lag_layer(u_eff_prev_real, u_raw_real)
             u_eff_seed_norm = self.u_normed(u_eff_seed_real)
             alpha_in = self._pack_gru_features(x_norm, u_raw_norm, u_eff_seed_norm, h)

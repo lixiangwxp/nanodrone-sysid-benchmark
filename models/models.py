@@ -316,6 +316,10 @@ class ResidualQuadModel(BaseQuadModel):
         #控制 u 已经进 MLP 当条件
         #输出的 dx 只作用在状态上，不会莫名其妙改 u。
 
+
+
+
+
 # ============================================================
 # === 3. Physics+Residual model (Physics + NN correction)
 # ============================================================
