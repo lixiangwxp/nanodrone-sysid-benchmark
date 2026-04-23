@@ -337,8 +337,6 @@ class LagPhysResGRUModel(LagPhysResQuadModel):
 
         # 2) 可学习模块：执行器滞后层
         self.lag_layer = MotorLagLayer(lag_mode=lag_mode, alpha_init=alpha_init)
-        #  可学习模块：GRU 初始化、动态 alpha 头、GRUCell
-        self.h_init = nn.Sequential(nn.Linear(state_dim, hidden_dim), nn.Tanh())
 
         # 3) 冻结参数：物理主干参与前向，但不参与训练更新
         for param in self.phys.parameters():
@@ -348,6 +346,8 @@ class LagPhysResGRUModel(LagPhysResQuadModel):
         # 4) 维度与结构检查
         state_dim = residual.out.out_features
         #state_dim：与状态/残差同维，12（最后一层Linear输出 12）。
+        #  可学习模块：GRU 初始化、动态 alpha 头、GRUCell
+        self.h_init = nn.Sequential(nn.Linear(state_dim, hidden_dim), nn.Tanh())
 
         control_dim = 4
         feature_dim = state_dim + 3 * control_dim + hidden_dim
