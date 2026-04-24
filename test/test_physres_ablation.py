@@ -36,7 +36,11 @@ def parse_json_list(raw_value, arg_name):
 
 
 def uses_lag(variant):
-    return variant in {"lag", "lag_gru", "lag_gru_uinit", "lag_gru_alpha4", "lag_gru_ctrl", "lag_gru_torque", "lag_gru_force", "lag_geo", "full"}
+    return variant in {"lag", "lag_gru", "lag_gru_uinit", "lag_gru_histinit_honly", "lag_gru_alpha4", "lag_gru_ctrl", "lag_gru_torque", "lag_gru_force", "lag_geo", "full"}
+
+
+def uses_hist_init(variant):
+    return variant == "lag_gru_histinit_honly"
 
 
 def find_latest_model(model_root):
@@ -54,7 +58,7 @@ def find_latest_model(model_root):
     return model_files[0]
 
 
-def load_test_datasets(test_trajs, data_root, horizon):
+def load_test_datasets(test_trajs, data_root, horizon, history_len=0, start_offset=0):
     datasets = []
     for traj in test_trajs:
         for run in [1, 2, 3]:
@@ -62,7 +66,14 @@ def load_test_datasets(test_trajs, data_root, horizon):
             file_path = data_root / file_name
             try:
                 df = pd.read_csv(file_path)
-                datasets.append(QuadDataset(df, horizon=horizon))
+                datasets.append(
+                    QuadDataset(
+                        df,
+                        horizon=horizon,
+                        history_len=history_len,
+                        start_offset=start_offset,
+                    )
+                )
             except Exception as exc:
                 print(f"⚠️ Skipped {file_path}: {exc}")
 
@@ -85,7 +96,7 @@ def rebuild_model(checkpoint, x_scaler, u_scaler, device):
     gru_hidden_dim = config.get("gru_hidden_dim", 64)
     num_layers = config.get("num_layers", 5)
     default_residual_input_dim = 4
-    if variant in {"lag_gru", "lag_gru_uinit", "lag_gru_alpha4", "lag_gru_ctrl", "lag_gru_torque", "lag_gru_force"}:
+    if variant in {"lag_gru", "lag_gru_uinit", "lag_gru_histinit_honly", "lag_gru_alpha4", "lag_gru_ctrl", "lag_gru_torque", "lag_gru_force"}:
         default_residual_input_dim = gru_hidden_dim + 12
     elif uses_lag(variant):
         default_residual_input_dim = 12
@@ -122,6 +133,21 @@ def rebuild_model(checkpoint, x_scaler, u_scaler, device):
             alpha_dim=1,
             use_u_init=True,
             u_init_scale=0.05,
+        ).to(device)
+    elif variant == "lag_gru_histinit_honly":
+        model = LagPhysResGRUModel(
+            phys=phys_model,
+            residual=residual_model,
+            x_scaler=x_scaler,
+            u_scaler=u_scaler,
+            lag_mode=config.get("lag_mode", "per_motor"),
+            alpha_init=config.get("alpha_init", 0.85),
+            hidden_dim=gru_hidden_dim,
+            alpha_dim=1,
+            use_u_init=False,
+            u_init_scale=0.05,
+            use_hist_init=True,
+            hist_init_scale=config.get("hist_init_scale", 0.1),
         ).to(device)
     elif variant == "lag_gru_alpha4":
         model = LagPhysResGRUModel(
@@ -195,10 +221,16 @@ def main():
     parser.add_argument("--model_path", type=str, default=None)
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--horizon", type=int, default=50)
+    parser.add_argument("--history-len", type=int, default=0)
+    parser.add_argument("--start-offset", type=int, default=0)
     parser.add_argument("--test_trajs", type=str, default='["melon"]')
     parser.add_argument("--out_root", type=str, default=str(PROJECT_ROOT / "out" / "predictions"))
     parser.add_argument("--data_root", type=str, default=str(PROJECT_ROOT / "data" / "test"))
     args = parser.parse_args()
+    if args.history_len < 0:
+        raise ValueError("--history-len must be >= 0")
+    if args.start_offset < 0:
+        raise ValueError("--start-offset must be >= 0")
 
     test_trajs = parse_json_list(args.test_trajs, "test_trajs")
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
@@ -215,6 +247,13 @@ def main():
 
     checkpoint = torch.load(model_path, map_location=device)
     variant = checkpoint["config"]["variant"]
+    history_len = checkpoint["config"].get("history_len", args.history_len)
+    if uses_hist_init(variant) and history_len <= 0:
+        raise ValueError(
+            "lag_gru_histinit_honly requires history_len from checkpoint config "
+            "or --history-len > 0"
+        )
+    effective_start_offset = max(args.start_offset, history_len) if uses_hist_init(variant) else args.start_offset
 
     scaler_dir_str = checkpoint.get("scaler_dir")
     if scaler_dir_str is not None and Path(scaler_dir_str).exists():
@@ -223,7 +262,13 @@ def main():
         scaler_dir = PROJECT_ROOT / "scalers" / model_name
 
     data_root = Path(args.data_root)
-    test_ds = load_test_datasets(test_trajs, data_root, args.horizon)
+    test_ds = load_test_datasets(
+        test_trajs,
+        data_root,
+        args.horizon,
+        history_len=history_len if uses_hist_init(variant) else 0,
+        start_offset=effective_start_offset,
+    )
     test_dataset = combine_concat_dataset(
         ConcatDataset(test_ds), scale=True, fold="test", scaler_dir=scaler_dir
     )
@@ -238,10 +283,18 @@ def main():
 
     preds, trues = [], []
     with torch.no_grad():
-        for x0, u_seq, x_seq_true in test_loader:
+        for batch in test_loader:
+            x0, u_seq, x_seq_true = batch[:3]
             x0 = x0.to(device)
             u_seq = u_seq.to(device)
-            x_pred = model(x0, u_seq).cpu()
+
+            if uses_hist_init(variant):
+                x_hist, u_hist = batch[3:5]
+                x_hist = x_hist.to(device)
+                u_hist = u_hist.to(device)
+                x_pred = model(x0, u_seq, x_hist=x_hist, u_hist=u_hist).cpu()
+            else:
+                x_pred = model(x0, u_seq).cpu()
             preds.append(x_pred)
             trues.append(x_seq_true)
 
@@ -251,11 +304,18 @@ def main():
     x_scaler = test_dataset.x_scaler
     preds = x_scaler.inverse_transform(preds.reshape(-1, preds.shape[-1])).reshape(preds.shape)
     trues = x_scaler.inverse_transform(trues.reshape(-1, trues.shape[-1])).reshape(trues.shape)
+    start_indices = (
+        test_dataset.start_indices.cpu().numpy()
+        if getattr(test_dataset, "start_indices", None) is not None
+        else np.arange(preds.shape[0])
+    )
 
     state_names = ["x", "y", "z", "vx", "vy", "vz", "rx", "ry", "rz", "wx", "wy", "wz"]
 
     num_windows = preds.shape[0]
-    data = {"t": np.arange(num_windows) * dt}
+    if len(start_indices) != num_windows:
+        raise ValueError("Prediction windows and start indices are misaligned")
+    data = {"start_idx": start_indices, "t": start_indices * dt}
     for idx, name in enumerate(state_names):
         data[name] = trues[:, 0, idx]
 

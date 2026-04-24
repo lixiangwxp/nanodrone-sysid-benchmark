@@ -43,7 +43,7 @@ from utils.wandb_utils import (
 )
 
 
-VARIANT_CHOICES = ["baseline", "geo", "lag", "lag_gru", "lag_gru_uinit", "lag_gru_alpha4", "lag_gru_ctrl", "lag_gru_torque", "lag_gru_force", "lag_geo", "full"]
+VARIANT_CHOICES = ["baseline", "geo", "lag", "lag_gru", "lag_gru_uinit", "lag_gru_histinit_honly", "lag_gru_alpha4", "lag_gru_ctrl", "lag_gru_torque", "lag_gru_force", "lag_geo", "full"]
 DEFAULT_AUX_COLS_RAW = '["az_body"]'
 DEFAULT_FORCE_AUX_COLS = ["ax_body", "ay_body", "az_body"]
 
@@ -58,7 +58,7 @@ def parse_json_list(raw_value, arg_name):
 
 
 def uses_lag(variant):
-    return variant in {"lag", "lag_gru", "lag_gru_uinit", "lag_gru_alpha4", "lag_gru_ctrl", "lag_gru_torque", "lag_gru_force", "lag_geo", "full"}
+    return variant in {"lag", "lag_gru", "lag_gru_uinit", "lag_gru_histinit_honly", "lag_gru_alpha4", "lag_gru_ctrl", "lag_gru_torque", "lag_gru_force", "lag_geo", "full"}
 
 
 def uses_geo_loss(variant):
@@ -75,6 +75,10 @@ def uses_force_supervision(variant):
 
 def uses_aux_dataset(variant):
     return uses_aux_supervision(variant) or uses_force_supervision(variant)
+
+
+def uses_hist_init(variant):
+    return variant == "lag_gru_histinit_honly"
 
 def build_model_name(variant, train_trajs, loss_type="exp", name_suffix=""):
     parts = ["physres", variant]
@@ -96,7 +100,17 @@ def build_phys_params():
 
 
 #  是“把某个数据划分里的多个 CSV 文件读进来，并转成 dataset 对象列表”的。
-def load_split(trajs, runs, data_dir, split, horizon, use_aux=False, aux_cols=None):
+def load_split(
+    trajs,
+    runs,
+    data_dir,
+    split,
+    horizon,
+    use_aux=False,
+    aux_cols=None,
+    history_len=0,
+    start_offset=0,
+):
     datasets = []
     for traj in trajs:
         for run in runs:
@@ -112,7 +126,12 @@ def load_split(trajs, runs, data_dir, split, horizon, use_aux=False, aux_cols=No
                     use_acc_aux=True,
                 )
             else:
-                ds = QuadDataset(df, horizon=horizon)
+                ds = QuadDataset(
+                    df,
+                    horizon=horizon,
+                    history_len=history_len,
+                    start_offset=start_offset,
+                )
             datasets.append(ds)
     if not datasets:
         raise RuntimeError(f"❌ No datasets could be loaded for {split} from {data_dir}")
@@ -134,9 +153,10 @@ def build_model(
     gru_hidden_dim,
     torque_scale_factor,
     control_ctx_dim,
+    hist_init_scale,
 ):
     num_layers = 5
-    if variant in {"lag_gru", "lag_gru_uinit", "lag_gru_alpha4", "lag_gru_ctrl", "lag_gru_torque", "lag_gru_force"}:
+    if variant in {"lag_gru", "lag_gru_uinit", "lag_gru_histinit_honly", "lag_gru_alpha4", "lag_gru_ctrl", "lag_gru_torque", "lag_gru_force"}:
         residual_input_dim = gru_hidden_dim + 12
         #对 lag_gru 相关的模型，残差网络看的是：GRU 隐状态（gru_hidden_dim维）和原始控制相关的12维量（u_raw：4维，u_eff：4维，u_raw - u_eff：4维），合起来就是 gru_hidden_dim + 12 维
         #GRU 隐状态 h 可以理解成一个“学出来的记忆向量”，
@@ -182,6 +202,21 @@ def build_model(
             alpha_dim=1,
             use_u_init=True,
             u_init_scale=0.05,
+        )
+    elif variant == "lag_gru_histinit_honly":
+        model = LagPhysResGRUModel(
+            phys=phys_model,
+            residual=residual_model,
+            x_scaler=x_scaler,
+            u_scaler=u_scaler,
+            lag_mode=lag_mode,
+            alpha_init=alpha_init,
+            hidden_dim=gru_hidden_dim,
+            alpha_dim=1,
+            use_u_init=False,
+            u_init_scale=0.05,
+            use_hist_init=True,
+            hist_init_scale=hist_init_scale,
         )
     elif variant == "lag_gru_alpha4":
         model = LagPhysResGRUModel(
@@ -310,7 +345,7 @@ def build_autocast_context(device, enabled):
 #配置怎么更新参数
 def build_optimizer(model, variant, base_lr):
     weight_decay = 1e-5
-    if variant not in {"lag_gru", "lag_gru_uinit", "lag_gru_alpha4", "lag_gru_ctrl", "lag_gru_torque", "lag_gru_force"}:
+    if variant not in {"lag_gru", "lag_gru_uinit", "lag_gru_histinit_honly", "lag_gru_alpha4", "lag_gru_ctrl", "lag_gru_torque", "lag_gru_force"}:
         return optim.Adam(model.parameters(), lr=base_lr, weight_decay=weight_decay)
 
     grouped_ids = set()
@@ -329,10 +364,12 @@ def build_optimizer(model, variant, base_lr):
 
     #“快学习率”的参数组
     fast_params = collect_params(getattr(model, "u_init_head", None))
+    fast_params.extend(collect_params(getattr(model, "hist_h_head", None)))
     fast_params.extend(collect_params(getattr(model, "alpha_head", None)))
 
     #“中等学习率”的参数组
     medium_params = collect_params(getattr(model, "gru_cell", None))
+    medium_params.extend(collect_params(getattr(model, "hist_encoder", None)))
     medium_params.extend(collect_params(getattr(model, "control_encoder", None)))
     medium_params.extend(collect_params(getattr(model, "ctx_h0_adapter", None)))
     medium_params.extend(collect_params(getattr(model, "ctx_step_adapter", None)))
@@ -395,6 +432,8 @@ def build_checkpoint(
     loss_type,
     torque_scale_factor,
     control_ctx_dim,
+    history_len,
+    hist_init_scale,
     init_from,
     freeze_non_torque,
     amp_enabled,
@@ -433,8 +472,11 @@ def build_checkpoint(
             "lr_end": lr_end,
             "batch_size": batch_size,
             "gru_hidden_dim": (
-                gru_hidden_dim if variant in {"lag_gru", "lag_gru_uinit", "lag_gru_alpha4", "lag_gru_ctrl", "lag_gru_torque", "lag_gru_force"} else None
+                gru_hidden_dim if variant in {"lag_gru", "lag_gru_uinit", "lag_gru_histinit_honly", "lag_gru_alpha4", "lag_gru_ctrl", "lag_gru_torque", "lag_gru_force"} else None
             ),
+            "use_hist_init": bool(getattr(model, "use_hist_init", False)),
+            "history_len": history_len if uses_hist_init(variant) else 0,
+            "hist_init_scale": hist_init_scale if uses_hist_init(variant) else None,
             "loss_type": loss_type,
             "torque_scale_factor": torque_scale_factor,
             "control_ctx_dim": control_ctx_dim,
@@ -592,8 +634,17 @@ def validate_resume_checkpoint(checkpoint, args, train_trajs, valid_trajs, aux_c
         expected_pairs.append(("lr_end", args.lr_end, config.get("lr_end")))
     if config.get("hidden_dim") is not None:
         expected_pairs.append(("hidden_dim", args.hidden_dim, config.get("hidden_dim")))
-    if args.variant in {"lag_gru", "lag_gru_uinit", "lag_gru_alpha4", "lag_gru_ctrl", "lag_gru_torque", "lag_gru_force"} and config.get("gru_hidden_dim") is not None:
+    if args.variant in {"lag_gru", "lag_gru_uinit", "lag_gru_histinit_honly", "lag_gru_alpha4", "lag_gru_ctrl", "lag_gru_torque", "lag_gru_force"} and config.get("gru_hidden_dim") is not None:
         expected_pairs.append(("gru_hidden_dim", args.gru_hidden_dim, config.get("gru_hidden_dim")))
+    if args.variant == "lag_gru_histinit_honly":
+        expected_pairs.append(("history_len", args.history_len, config.get("history_len", 0)))
+        expected_pairs.append(
+            (
+                "hist_init_scale",
+                args.hist_init_scale,
+                config.get("hist_init_scale", 0.1),
+            )
+        )
     if args.variant == "lag_gru_ctrl":
         expected_pairs.append(
             (
@@ -669,6 +720,8 @@ def main():
     parser.add_argument("--variant", type=str, default="baseline", choices=VARIANT_CHOICES)
     parser.add_argument("--hidden-dim", type=int, default=64)
     parser.add_argument("--gru-hidden-dim", type=int, default=64)
+    parser.add_argument("--history-len", type=int, default=0)
+    parser.add_argument("--hist-init-scale", type=float, default=0.1)
     parser.add_argument("--lr-start", "--lr_start", dest="lr_start", type=float, default=1e-5)
     parser.add_argument("--lr-end", "--lr_end", dest="lr_end", type=float, default=1e-8)
     parser.add_argument("--loss-type", type=str, default="exp", choices=["exp", "mixed", "mixed_early"])
@@ -747,6 +800,10 @@ def main():
         raise ValueError("--freeze-non-torque is only supported for --variant lag_gru_torque.")
     if args.log_diagnostics_every < 0:
         raise ValueError("--log-diagnostics-every must be >= 0.")
+    if args.history_len < 0:
+        raise ValueError("--history-len must be >= 0.")
+    if args.variant == "lag_gru_histinit_honly" and args.history_len <= 0:
+        raise ValueError("--history-len must be > 0 for lag_gru_histinit_honly")
 
     train_trajs = parse_json_list(args.train_trajs, "train_trajs")
     aux_cols = parse_json_list(args.aux_cols, "aux_cols")
@@ -830,6 +887,7 @@ def main():
     use_aux = uses_aux_supervision(args.variant)#要不要 aux loss
     use_aux_data = uses_aux_dataset(args.variant)#数据集要不要多读 aux 列
     force_aux_available = uses_force_supervision(args.variant)#：当前是不是 force-aware 这条分支
+    history_len = args.history_len if uses_hist_init(args.variant) else 0
 
     try:
         train_ds = load_split(
@@ -840,6 +898,7 @@ def main():
             args.horizon,
             use_aux=use_aux_data,
             aux_cols=aux_cols,
+            history_len=history_len,
         )
         valid_ds = load_split(
             valid_trajs,
@@ -849,6 +908,7 @@ def main():
             args.horizon,
             use_aux=use_aux_data,
             aux_cols=aux_cols,
+            history_len=history_len,
         )
     except Exception as exc:
         if not uses_force_supervision(args.variant):
@@ -866,6 +926,7 @@ def main():
             args.horizon,
             use_aux=False,
             aux_cols=aux_cols,
+            history_len=history_len,
         )
         valid_ds = load_split(
             valid_trajs,
@@ -875,6 +936,7 @@ def main():
             args.horizon,
             use_aux=False,
             aux_cols=aux_cols,
+            history_len=history_len,
         )
 
     if use_aux:
@@ -981,6 +1043,7 @@ def main():
         gru_hidden_dim=args.gru_hidden_dim,
         torque_scale_factor=args.torque_scale_factor,
         control_ctx_dim=args.control_ctx_dim,
+        hist_init_scale=args.hist_init_scale,
         )#准备物理模型常数。
     model = model.to(device)
     resolved_init_from = None
@@ -1040,6 +1103,8 @@ def main():
             "lr_start": lr_start,
             "lr_end": lr_end,
             "control_ctx_dim": args.control_ctx_dim,
+            "history_len": history_len,
+            "hist_init_scale": args.hist_init_scale,
             "resolved_init_from": resolved_init_from,
         },
         tags=["physres-ablation", args.variant, *train_trajs],
@@ -1264,6 +1329,8 @@ def main():
             loss_type=args.loss_type,
             torque_scale_factor=args.torque_scale_factor,
             control_ctx_dim=args.control_ctx_dim,
+            history_len=history_len,
+            hist_init_scale=args.hist_init_scale,
             init_from=resolved_init_from,
             freeze_non_torque=args.freeze_non_torque,
             amp_enabled=amp_enabled,

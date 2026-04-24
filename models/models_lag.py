@@ -327,6 +327,8 @@ class LagPhysResGRUModel(LagPhysResQuadModel):
         alpha_dim=1,
         use_u_init=False,
         u_init_scale=0.05,
+        use_hist_init=False,
+        hist_init_scale=0.1,
     ):
         nn.Module.__init__(self)
 
@@ -348,6 +350,8 @@ class LagPhysResGRUModel(LagPhysResQuadModel):
         self.alpha_dim = int(alpha_dim)
         self.use_u_init = bool(use_u_init)
         self.u_init_scale = float(u_init_scale)
+        self.use_hist_init = bool(use_hist_init)
+        self.hist_init_scale = float(hist_init_scale)
         if self.alpha_dim not in (1, 4):
             raise ValueError("alpha_dim must be 1 or 4")
 
@@ -384,6 +388,23 @@ class LagPhysResGRUModel(LagPhysResQuadModel):
         else:
             self.u_init_head = None
 
+        if self.use_hist_init:
+            self.hist_encoder = nn.GRU(
+                input_size=state_dim + control_dim,
+                hidden_size=hidden_dim,
+                batch_first=True,
+            )
+            self.hist_h_head = nn.Sequential(
+                nn.Linear(hidden_dim + state_dim, hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, hidden_dim),
+            )
+            nn.init.zeros_(self.hist_h_head[-1].weight)
+            nn.init.zeros_(self.hist_h_head[-1].bias)
+        else:
+            self.hist_encoder = None
+            self.hist_h_head = None
+
         
         #h，形状 (B, hidden_dim)
         #由当前状态、指令、滞后 seed、GRU 记忆共同决定这一步的混合系数。
@@ -411,7 +432,7 @@ class LagPhysResGRUModel(LagPhysResQuadModel):
 
 
 
-    def forward(self, x0, u_seq):
+    def forward(self, x0, u_seq, x_hist=None, u_hist=None):
         # 兼容单步控制输入 (B,4)；统一成时序输入 (B,T,4) 做 rollout。
         if u_seq.ndim == 2:
             u_seq = u_seq.unsqueeze(1)
@@ -425,6 +446,33 @@ class LagPhysResGRUModel(LagPhysResQuadModel):
         preds = []
         # 从当前状态生成初始记忆h；执行器内部状态用第一步控制作seed。
         h = self.h_init(x_norm)
+
+        if self.use_hist_init:
+            if x_hist is None or u_hist is None:
+                raise ValueError("x_hist and u_hist are required when use_hist_init=True")
+            if x_hist.ndim != 3 or u_hist.ndim != 3:
+                raise ValueError("x_hist and u_hist must be 3D tensors")
+            if x_hist.shape[0] != x_norm.shape[0] or u_hist.shape[0] != x_norm.shape[0]:
+                raise ValueError("history batch size mismatch")
+            if x_hist.shape[-1] != x_norm.shape[-1]:
+                raise ValueError("x_hist last dimension must match state dim")
+            if u_hist.shape[-1] != u_seq.shape[-1]:
+                raise ValueError("u_hist last dimension must match control dim")
+            if x_hist.shape[1] != u_hist.shape[1] + 1:
+                raise ValueError("x_hist must have length L+1 and u_hist length L")
+            if not torch.allclose(x_hist[:, -1, :], x_norm, atol=1e-6, rtol=1e-6):
+                raise ValueError("x_hist must end at x0")
+
+            hist_input = torch.cat([x_hist[:, :-1, :], u_hist], dim=-1)
+            _, hist_hidden = self.hist_encoder(hist_input)
+            e_hist = hist_hidden[-1]
+            # Optional history-conditioned initialization of the observer hidden state.
+            # The zero-initialized head makes this path initially identical to h0 = h_init(x0).
+            delta_h = self.hist_init_scale * torch.tanh(
+                self.hist_h_head(torch.cat([e_hist, x_norm], dim=-1))
+            )
+            h = h + delta_h
+
         u0_norm = u_seq[:, 0, :]
 
         # Optional learned initialization of the effective actuator state.
