@@ -36,7 +36,7 @@ def parse_json_list(raw_value, arg_name):
 
 
 def uses_lag(variant):
-    return variant in {"lag", "lag_gru", "lag_gru_ctrl", "lag_gru_torque", "lag_gru_force", "lag_geo", "full"}
+    return variant in {"lag", "lag_gru", "lag_gru_alpha4", "lag_gru_ctrl", "lag_gru_torque", "lag_gru_force", "lag_geo", "full"}
 
 
 def find_latest_model(model_root):
@@ -85,7 +85,7 @@ def rebuild_model(checkpoint, x_scaler, u_scaler, device):
     gru_hidden_dim = config.get("gru_hidden_dim", 64)
     num_layers = config.get("num_layers", 5)
     default_residual_input_dim = 4
-    if variant in {"lag_gru", "lag_gru_ctrl", "lag_gru_torque", "lag_gru_force"}:
+    if variant in {"lag_gru", "lag_gru_alpha4", "lag_gru_ctrl", "lag_gru_torque", "lag_gru_force"}:
         default_residual_input_dim = gru_hidden_dim + 12
     elif uses_lag(variant):
         default_residual_input_dim = 12
@@ -109,6 +109,17 @@ def rebuild_model(checkpoint, x_scaler, u_scaler, device):
             lag_mode=config.get("lag_mode", "per_motor"),
             alpha_init=config.get("alpha_init", 0.85),
             hidden_dim=gru_hidden_dim,
+        ).to(device)
+    elif variant == "lag_gru_alpha4":
+        model = LagPhysResGRUModel(
+            phys=phys_model,
+            residual=residual_model,
+            x_scaler=x_scaler,
+            u_scaler=u_scaler,
+            lag_mode=config.get("lag_mode", "per_motor"),
+            alpha_init=config.get("alpha_init", 0.85),
+            hidden_dim=gru_hidden_dim,
+            alpha_dim=4,
         ).to(device)
     elif variant == "lag_gru_ctrl":
         model = LagPhysResGRUControlModel(

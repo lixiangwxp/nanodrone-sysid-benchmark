@@ -43,7 +43,7 @@ from utils.wandb_utils import (
 )
 
 
-VARIANT_CHOICES = ["baseline", "geo", "lag", "lag_gru", "lag_gru_ctrl", "lag_gru_torque", "lag_gru_force", "lag_geo", "full"]
+VARIANT_CHOICES = ["baseline", "geo", "lag", "lag_gru", "lag_gru_alpha4", "lag_gru_ctrl", "lag_gru_torque", "lag_gru_force", "lag_geo", "full"]
 DEFAULT_AUX_COLS_RAW = '["az_body"]'
 DEFAULT_FORCE_AUX_COLS = ["ax_body", "ay_body", "az_body"]
 
@@ -58,7 +58,7 @@ def parse_json_list(raw_value, arg_name):
 
 
 def uses_lag(variant):
-    return variant in {"lag", "lag_gru", "lag_gru_ctrl", "lag_gru_torque", "lag_gru_force", "lag_geo", "full"}
+    return variant in {"lag", "lag_gru", "lag_gru_alpha4", "lag_gru_ctrl", "lag_gru_torque", "lag_gru_force", "lag_geo", "full"}
 
 
 def uses_geo_loss(variant):
@@ -136,7 +136,7 @@ def build_model(
     control_ctx_dim,
 ):
     num_layers = 5
-    if variant in {"lag_gru", "lag_gru_ctrl", "lag_gru_torque", "lag_gru_force"}:
+    if variant in {"lag_gru", "lag_gru_alpha4", "lag_gru_ctrl", "lag_gru_torque", "lag_gru_force"}:
         residual_input_dim = gru_hidden_dim + 12
         #对 lag_gru 相关的模型，残差网络看的是：GRU 隐状态（gru_hidden_dim维）和原始控制相关的12维量（u_raw：4维，u_eff：4维，u_raw - u_eff：4维），合起来就是 gru_hidden_dim + 12 维
         #GRU 隐状态 h 可以理解成一个“学出来的记忆向量”，
@@ -169,6 +169,17 @@ def build_model(
             lag_mode=lag_mode,
             alpha_init=alpha_init,
             hidden_dim=gru_hidden_dim,
+        )
+    elif variant == "lag_gru_alpha4":
+        model = LagPhysResGRUModel(
+            phys=phys_model,
+            residual=residual_model,
+            x_scaler=x_scaler,
+            u_scaler=u_scaler,
+            lag_mode=lag_mode,
+            alpha_init=alpha_init,
+            hidden_dim=gru_hidden_dim,
+            alpha_dim=4,
         )
     elif variant == "lag_gru_ctrl":
         model = LagPhysResGRUControlModel(
@@ -286,7 +297,7 @@ def build_autocast_context(device, enabled):
 #配置怎么更新参数
 def build_optimizer(model, variant, base_lr):
     weight_decay = 1e-5
-    if variant not in {"lag_gru", "lag_gru_ctrl", "lag_gru_torque", "lag_gru_force"}:
+    if variant not in {"lag_gru", "lag_gru_alpha4", "lag_gru_ctrl", "lag_gru_torque", "lag_gru_force"}:
         return optim.Adam(model.parameters(), lr=base_lr, weight_decay=weight_decay)
 
     grouped_ids = set()
@@ -409,7 +420,7 @@ def build_checkpoint(
             "lr_end": lr_end,
             "batch_size": batch_size,
             "gru_hidden_dim": (
-                gru_hidden_dim if variant in {"lag_gru", "lag_gru_ctrl", "lag_gru_torque", "lag_gru_force"} else None
+                gru_hidden_dim if variant in {"lag_gru", "lag_gru_alpha4", "lag_gru_ctrl", "lag_gru_torque", "lag_gru_force"} else None
             ),
             "loss_type": loss_type,
             "torque_scale_factor": torque_scale_factor,
@@ -568,7 +579,7 @@ def validate_resume_checkpoint(checkpoint, args, train_trajs, valid_trajs, aux_c
         expected_pairs.append(("lr_end", args.lr_end, config.get("lr_end")))
     if config.get("hidden_dim") is not None:
         expected_pairs.append(("hidden_dim", args.hidden_dim, config.get("hidden_dim")))
-    if args.variant in {"lag_gru", "lag_gru_ctrl", "lag_gru_torque", "lag_gru_force"} and config.get("gru_hidden_dim") is not None:
+    if args.variant in {"lag_gru", "lag_gru_alpha4", "lag_gru_ctrl", "lag_gru_torque", "lag_gru_force"} and config.get("gru_hidden_dim") is not None:
         expected_pairs.append(("gru_hidden_dim", args.gru_hidden_dim, config.get("gru_hidden_dim")))
     if args.variant == "lag_gru_ctrl":
         expected_pairs.append(

@@ -324,6 +324,7 @@ class LagPhysResGRUModel(LagPhysResQuadModel):
         lag_mode="per_motor",
         alpha_init=0.85,
         hidden_dim=64,
+        alpha_dim=1,
     ):
         nn.Module.__init__(self)
 
@@ -342,6 +343,9 @@ class LagPhysResGRUModel(LagPhysResQuadModel):
         for param in self.phys.parameters():
             param.requires_grad_(False)
         self.gru_hidden_dim = hidden_dim
+        self.alpha_dim = int(alpha_dim)
+        if self.alpha_dim not in (1, 4):
+            raise ValueError("alpha_dim must be 1 or 4")
 
         # 4) 维度与结构检查
         state_dim = residual.out.out_features
@@ -371,7 +375,7 @@ class LagPhysResGRUModel(LagPhysResQuadModel):
         self.alpha_head = nn.Sequential(
             nn.Linear(feature_dim, hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, 1),
+            nn.Linear(hidden_dim, self.alpha_dim),
         )
         nn.init.zeros_(self.alpha_head[-1].weight)#训练刚开始时，alpha_head 基本会输出接近 alpha_init 的常数。
         nn.init.constant_(self.alpha_head[-1].bias, math.log(alpha_init / (1.0 - alpha_init)))
@@ -417,6 +421,8 @@ class LagPhysResGRUModel(LagPhysResQuadModel):
             u_eff_seed_real = self.lag_layer(u_eff_prev_real, u_raw_real)
             u_eff_seed_norm = self.u_normed(u_eff_seed_real)
             alpha_in = self._pack_gru_features(x_norm, u_raw_norm, u_eff_seed_norm, h)
+            # alpha_dim=1: shared dynamic alpha over motors
+            # alpha_dim=4: motor-wise dynamic alpha
             alpha_t = torch.sigmoid(self.alpha_head(alpha_in))
 
             # 最终有效电机转速：在上一时刻执行器状态和当前 raw 指令之间动态插值。
