@@ -202,10 +202,14 @@ class PhysQuadModel(BaseQuadModel):
             acc = (thrust_w - self.m * self.gravity) / self.m
 
             # --- rotational dynamics ---
-            J_omega = omega @ self.J.T
-            omega_dot = 0.0 * torch.linalg.solve(
-                self.J, (tau - torch.cross(omega, J_omega, dim=-1)).unsqueeze(-1)
-            ).squeeze(-1)
+            # Performance-only: preserve the current zeroed physics behavior without the dead solve.
+            omega_dot = torch.zeros_like(omega)
+            # Original dead computation kept for reference:
+            # J_omega = omega @ self.J.T
+            # omega_dot = 0.0 * torch.linalg.solve(
+            #     self.J,
+            #     (tau - torch.cross(omega, J_omega, dim=-1)).unsqueeze(-1),
+            # ).squeeze(-1)
 
             # --- quaternion derivative ---
             quat_dot = self.quat_derivative(quat, omega)

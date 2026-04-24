@@ -326,7 +326,8 @@ def _compute_force_loss(model, batch, force_pred_seq, u_eff_seq_real, device, be
         zero = force_pred_seq.detach().new_tensor(0.0)
         return zero, zero
 
-    aux_seq = batch[3].to(device)
+    # IO-only optimization: allow pinned-memory batches to overlap host->device copies.
+    aux_seq = batch[3].to(device, non_blocking=True)
     if aux_seq.shape[-1] < 3:
         zero = force_pred_seq.detach().new_tensor(0.0)
         return zero, zero
@@ -344,10 +345,15 @@ def _compute_force_loss(model, batch, force_pred_seq, u_eff_seq_real, device, be
 
 def compute_loss(model, criterion, batch, device, loss_config):
     x0, u_seq, true_seq = batch[:3]
-    x0 = x0.to(device)
-    u_seq = u_seq.to(device)
-    true_seq = true_seq.to(device)
-    aux_seq = batch[3].to(device) if len(batch) > 3 else None
+    # IO-only optimization: preserve values while enabling async H2D copies when available.
+    x0 = x0.to(device, non_blocking=True)
+    u_seq = u_seq.to(device, non_blocking=True)
+    true_seq = true_seq.to(device, non_blocking=True)
+    aux_seq = (
+        batch[3].to(device, non_blocking=True)
+        if len(batch) > 3
+        else None
+    )
 
     aux_pred = None
     force_pred_seq = None

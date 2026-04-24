@@ -192,6 +192,7 @@ def prefix_metrics(prefix, metrics):
 
 
 def compute_gradient_norm(model):
+    # Logging-only diagnostic: keep this opt-in because it can still synchronize devices.
     total_sq_norm = 0.0
     for param in model.parameters():
         if param.grad is None:
@@ -202,6 +203,7 @@ def compute_gradient_norm(model):
 
 
 def compute_parameter_norm(model):
+    # Logging-only diagnostic: keep this opt-in because it scans every parameter tensor.
     total_sq_norm = 0.0
     for param in model.parameters():
         param_norm = param.detach().data.norm(2).item()
@@ -210,6 +212,7 @@ def compute_parameter_norm(model):
 
 
 def collect_lag_metrics(model):
+    # Logging-only diagnostic: keep this opt-in because it materializes CPU scalars for W&B.
     alpha = getattr(model, "alpha", None)
     if alpha is None or not torch.is_tensor(alpha):
         return {}

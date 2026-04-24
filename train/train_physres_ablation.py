@@ -246,9 +246,34 @@ def update_metric_totals(metric_totals, loss_dict):
         metric_totals.setdefault(key, 0.0)
         metric_totals[key] += value.item()
 
+
+def update_metric_totals_async(metric_totals, loss_dict):
+    # Performance-only: keep train metrics on-device until epoch end to avoid per-batch sync.
+    with torch.no_grad():
+        for key, value in loss_dict.items():
+            if not torch.is_tensor(value):
+                value = torch.as_tensor(value)
+            v = value.detach().float()
+            if key not in metric_totals:
+                metric_totals[key] = torch.zeros(
+                    (),
+                    device=v.device,
+                    dtype=torch.float32,
+                )
+            metric_totals[key].add_(v)
+
+
 #把一个epoch里累计的各项loss总和，除以batch数，变成平均值。
 def average_metrics(metric_totals, num_batches):
     return {key: value / num_batches for key, value in metric_totals.items()}
+
+
+def average_metrics_async(metric_totals, num_batches):
+    return {
+        key: (value / num_batches).item()
+        for key, value in metric_totals.items()
+    }
+
 
 #加快cuda计算速度
 def build_autocast_context(device, enabled):
@@ -673,6 +698,12 @@ def main():
         default=True,
         help="Enable CUDA automatic mixed precision for faster training.",
     )
+    parser.add_argument(
+        "--log-diagnostics-every",
+        type=int,
+        default=0,
+        help="Compute expensive diagnostic norms every N training batches; 0 disables them.",
+    )
     parser.add_argument("--save_every", type=int, default=0)
     parser.add_argument("--save_latest_every", type=int, default=1)
     parser.add_argument(
@@ -690,6 +721,8 @@ def main():
         raise ValueError("--init-from cannot be used together with --resume_path.")
     if args.freeze_non_torque and args.variant != "lag_gru_torque":
         raise ValueError("--freeze-non-torque is only supported for --variant lag_gru_torque.")
+    if args.log_diagnostics_every < 0:
+        raise ValueError("--log-diagnostics-every must be >= 0.")
 
     train_trajs = parse_json_list(args.train_trajs, "train_trajs")
     aux_cols = parse_json_list(args.aux_cols, "aux_cols")
@@ -989,6 +1022,7 @@ def main():
         group=f"physres_ablation__{'_'.join(train_trajs)}",
     )
     maybe_watch_model(wandb_run, model, args)
+    diagnostics_enabled = wandb_run is not None and args.log_diagnostics_every > 0
 
 
 
@@ -1048,11 +1082,15 @@ def main():
     for epoch in range(start_epoch, args.epochs):
         epoch_start = time.time()
         model.train()
-        train_metric_totals = init_metric_totals()
+        train_metric_totals = {}
         train_grad_norm_total = 0.0
         train_grad_norm_max = 0.0
+        train_grad_norm_batches = 0
         train_generator.manual_seed(seed + epoch)
-        for batch in tqdm(train_loader, desc=f"Epoch {epoch + 1}/{args.epochs} [Train]"):
+        for batch_idx, batch in enumerate(
+            tqdm(train_loader, desc=f"Epoch {epoch + 1}/{args.epochs} [Train]"),
+            start=1,
+        ):
             optimizer.zero_grad(set_to_none=True)
             with build_autocast_context(device, amp_enabled):
                 total_loss, loss_dict = compute_loss(
@@ -1066,16 +1104,23 @@ def main():
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
-            grad_norm = compute_gradient_norm(model)
-            train_grad_norm_total += grad_norm
-            train_grad_norm_max = max(train_grad_norm_max, grad_norm)
+            if diagnostics_enabled and batch_idx % args.log_diagnostics_every == 0:
+                # Logging-only diagnostics: keep training math unchanged and run them sparsely.
+                grad_norm = compute_gradient_norm(model)
+                train_grad_norm_total += grad_norm
+                train_grad_norm_max = max(train_grad_norm_max, grad_norm)
+                train_grad_norm_batches += 1
 
             scaler.step(optimizer)
             scaler.update()
-            update_metric_totals(train_metric_totals, loss_dict)
+            update_metric_totals_async(train_metric_totals, loss_dict)
 
-        avg_train_metrics = average_metrics(train_metric_totals, len(train_loader))
-        avg_train_grad_norm = train_grad_norm_total / len(train_loader)
+        avg_train_metrics = average_metrics_async(train_metric_totals, len(train_loader))
+        avg_train_grad_norm = (
+            train_grad_norm_total / train_grad_norm_batches
+            if train_grad_norm_batches > 0
+            else 0.0
+        )
 
         #验证阶段：遍历 valid_loader
         model.eval()
@@ -1228,7 +1273,6 @@ def main():
             "optim/lr": current_lr,
             "train/grad_norm_mean": avg_train_grad_norm,
             "train/grad_norm_max": train_grad_norm_max,
-            "model/param_norm": compute_parameter_norm(model),
             "best/val_loss": best_val_loss,
             "best/epoch": best_epoch or 0,
             "checkpoint/is_best": int(is_best),
@@ -1238,7 +1282,9 @@ def main():
         }
         wandb_metrics.update(prefix_metrics("train", avg_train_metrics))
         wandb_metrics.update(prefix_metrics("valid", avg_valid_metrics))
-        wandb_metrics.update(collect_lag_metrics(model))
+        if diagnostics_enabled:
+            wandb_metrics["model/param_norm"] = compute_parameter_norm(model)
+            wandb_metrics.update(collect_lag_metrics(model))
         log_metrics(wandb_run, wandb_metrics)
 
         if early_stop_triggered:
