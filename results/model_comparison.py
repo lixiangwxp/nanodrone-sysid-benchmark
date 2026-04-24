@@ -1,10 +1,12 @@
 import argparse
-import json
 import sys
+from datetime import datetime
 from pathlib import Path
 
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from scipy.spatial.transform import Rotation as R
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -13,8 +15,42 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from utils.latex_utils import print_latex_table_results
 from utils.metrics_utils import compute_errors, compute_simerr
-from utils.plot_utils import plot_metrics, plot_multistate_predictions, setup_matplotlib
-from utils.quat_utils import quat_to_euler_np, so3_log_to_quat_np
+from utils.plot_utils import setup_matplotlib
+
+
+SUMMARY_COLUMNS = [
+    "created_at",
+    "model_label",
+    "model_family",
+    "loss_name",
+    "model",
+    "pos_h1",
+    "pos_h10",
+    "pos_h50",
+    "vel_h1",
+    "vel_h10",
+    "vel_h50",
+    "rot_h1",
+    "rot_h10",
+    "rot_h50",
+    "omega_h1",
+    "omega_h10",
+    "omega_h50",
+    "sim_pos",
+    "sim_vel",
+    "sim_rot",
+    "sim_omega",
+]
+
+
+def so3_log_to_quat_np(r):
+    rot = R.from_rotvec(r)
+    return rot.as_quat()
+
+
+def quat_to_euler_np(q_xyzw):
+    rot = R.from_quat(q_xyzw)
+    return rot.as_euler("xyz", degrees=False)
 
 
 def add_rotation_columns(df):
@@ -32,20 +68,26 @@ def add_rotation_columns(df):
             continue
 
         r = df[[rx_col, ry_col, rz_col]].to_numpy(float)
-        q = so3_log_to_quat_np(r)
+        valid_mask = np.isfinite(r).all(axis=1)
+        q = np.full((len(df), 4), np.nan, dtype=float)
+        e = np.full((len(df), 3), np.nan, dtype=float)
 
-        new_cols[f"qx{suffix}"] = q[:, 0]
-        new_cols[f"qy{suffix}"] = q[:, 1]
-        new_cols[f"qz{suffix}"] = q[:, 2]
-        new_cols[f"qw{suffix}"] = q[:, 3]
+        if valid_mask.any():
+            q_valid = so3_log_to_quat_np(r[valid_mask])
+            e_valid = quat_to_euler_np(q_valid)
+            q[valid_mask] = q_valid
+            e[valid_mask] = e_valid
 
-        e = quat_to_euler_np(q)
         new_cols[f"roll{suffix}"] = e[:, 0]
         new_cols[f"pitch{suffix}"] = e[:, 1]
         new_cols[f"yaw{suffix}"] = e[:, 2]
         new_cols[f"roll{suffix}_deg"] = np.degrees(e[:, 0])
         new_cols[f"pitch{suffix}_deg"] = np.degrees(e[:, 1])
         new_cols[f"yaw{suffix}_deg"] = np.degrees(e[:, 2])
+        new_cols[f"qx{suffix}"] = q[:, 0]
+        new_cols[f"qy{suffix}"] = q[:, 1]
+        new_cols[f"qz{suffix}"] = q[:, 2]
+        new_cols[f"qw{suffix}"] = q[:, 3]
 
     return pd.concat([df, pd.DataFrame(new_cols, index=df.index)], axis=1)
 
@@ -56,15 +98,14 @@ def require_csv(path):
     return pd.read_csv(path)
 
 
-def load_manifest(path):
-    with open(path, "r", encoding="utf-8") as handle:
-        return json.load(handle)
-
-
-def build_summary_row(model_name, metrics):
+def build_summary_row(created_at, model_label, model_family, loss_name, metrics):
     sim_p, sim_v, sim_r, sim_w = compute_simerr(metrics)
     return {
-        "model": model_name,
+        "created_at": created_at,
+        "model_label": model_label,
+        "model_family": model_family,
+        "loss_name": loss_name,
+        "model": model_label,
         "pos_h1": metrics["pos"][1],
         "pos_h10": metrics["pos"][10],
         "pos_h50": metrics["pos"][50],
@@ -84,186 +125,380 @@ def build_summary_row(model_name, metrics):
     }
 
 
-def build_full12_summary_row(experiment, metrics):
-    row = build_summary_row(experiment["model_label"], metrics)
-    row["model_label"] = experiment["model_label"]
-    row["model_family"] = experiment["model_family"]
-    row["loss_name"] = experiment["loss_name"]
-    return row
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(
+        description="Compute benchmark metrics from one or more explicit prediction CSVs"
+    )
+    parser.add_argument(
+        "--prediction-csv",
+        action="append",
+        dest="prediction_csvs",
+        default=[],
+        help="Prediction CSV path. Repeat for multiple experiments.",
+    )
+    parser.add_argument(
+        "--model-label",
+        action="append",
+        dest="model_labels",
+        default=[],
+        help="Display name for each prediction CSV. Repeat in the same order as --prediction-csv.",
+    )
+    parser.add_argument(
+        "--model-family",
+        action="append",
+        dest="model_families",
+        default=[],
+        help="Optional model family for each prediction CSV. Repeat in the same order as --prediction-csv.",
+    )
+    parser.add_argument(
+        "--loss-name",
+        action="append",
+        dest="loss_names",
+        default=[],
+        help="Optional loss name for each prediction CSV. Repeat in the same order as --prediction-csv.",
+    )
+    parser.add_argument(
+        "--max-horizon",
+        type=int,
+        default=50,
+        help="Maximum prediction horizon to evaluate.",
+    )
+    parser.add_argument(
+        "--show-plots",
+        action="store_true",
+        help="Render metric and trajectory comparison plots for the supplied experiments.",
+    )
+    parser.add_argument(
+        "--summary-path",
+        type=str,
+        default=str(PROJECT_ROOT / "out" / "benchmark_summary.csv"),
+        help="CSV file to append the computed metrics to.",
+    )
+    args = parser.parse_args(argv)
+    validate_args(args)
+    return args
 
 
-def summarize_manifest(manifest_path, summary_path, max_horizon, expected_count=None):
-    manifest = load_manifest(manifest_path)
-    experiments = manifest.get("experiments", [])
-    completed_experiments = [
-        experiment
-        for experiment in experiments
-        if experiment.get("status") == "completed" and experiment.get("prediction_path")
-    ]
+def validate_args(args):
+    experiment_count = len(args.prediction_csvs)
+    if experiment_count == 0:
+        raise ValueError("At least one --prediction-csv must be provided.")
 
-    if not completed_experiments:
-        raise RuntimeError("❌ No completed experiments with prediction files were found in the manifest")
-
-    if expected_count is not None and len(completed_experiments) != expected_count:
-        raise RuntimeError(
-            "❌ Completed experiment count does not match expectation: "
-            f"expected {expected_count}, found {len(completed_experiments)}"
+    if len(args.model_labels) != experiment_count:
+        raise ValueError(
+            "--model-label count must match --prediction-csv count "
+            f"(got {len(args.model_labels)} labels for {experiment_count} CSVs)."
         )
 
-    summary_rows = []
-    for experiment in completed_experiments:
-        df_pred = add_rotation_columns(require_csv(Path(experiment["prediction_path"])))
+    if args.model_families and len(args.model_families) != experiment_count:
+        raise ValueError(
+            "--model-family count must match --prediction-csv count when provided "
+            f"(got {len(args.model_families)} families for {experiment_count} CSVs)."
+        )
+
+    if args.loss_names and len(args.loss_names) != experiment_count:
+        raise ValueError(
+            "--loss-name count must match --prediction-csv count when provided "
+            f"(got {len(args.loss_names)} values for {experiment_count} CSVs)."
+        )
+
+    if args.max_horizon < 50:
+        raise ValueError("--max-horizon must be at least 50 for the fixed *_h50 summary columns")
+
+
+def build_experiments(args):
+    experiment_count = len(args.prediction_csvs)
+    model_families = args.model_families or [""] * experiment_count
+    loss_names = args.loss_names or [""] * experiment_count
+
+    experiments = []
+    for idx in range(experiment_count):
+        experiments.append(
+            {
+                "prediction_csv": Path(args.prediction_csvs[idx]).expanduser().resolve(),
+                "model_label": args.model_labels[idx],
+                "model_family": model_families[idx],
+                "loss_name": loss_names[idx],
+            }
+        )
+    return experiments
+
+
+def evaluate_experiments(experiments, max_horizon):
+    evaluated = []
+    for experiment in experiments:
+        df_pred = add_rotation_columns(require_csv(experiment["prediction_csv"]))
         metrics = compute_errors(df_pred, max_horizon)
-        summary_rows.append(build_full12_summary_row(experiment, metrics))
+        evaluated.append(
+            {
+                **experiment,
+                "df_pred": df_pred,
+                "metrics": metrics,
+            }
+        )
+    return evaluated
 
-    summary_df = pd.DataFrame(summary_rows)
-    column_order = [
-        "model_label",
-        "model_family",
-        "loss_name",
-        "model",
-        "pos_h1",
-        "pos_h10",
-        "pos_h50",
-        "vel_h1",
-        "vel_h10",
-        "vel_h50",
-        "rot_h1",
-        "rot_h10",
-        "rot_h50",
-        "omega_h1",
-        "omega_h10",
-        "omega_h50",
-        "sim_pos",
-        "sim_vel",
-        "sim_rot",
-        "sim_omega",
+
+def build_summary_df(evaluated_experiments, created_at):
+    rows = [
+        build_summary_row(
+            created_at=created_at,
+            model_label=experiment["model_label"],
+            model_family=experiment["model_family"],
+            loss_name=experiment["loss_name"],
+            metrics=experiment["metrics"],
+        )
+        for experiment in evaluated_experiments
     ]
-    summary_df = summary_df[column_order]
+    return pd.DataFrame(rows, columns=SUMMARY_COLUMNS)
+
+
+def normalize_existing_summary(existing_df):
+    normalized = existing_df.copy()
+
+    if "model_label" not in normalized.columns:
+        if "model" in normalized.columns:
+            normalized["model_label"] = normalized["model"]
+        else:
+            normalized["model_label"] = ""
+    if "model" not in normalized.columns:
+        normalized["model"] = normalized["model_label"]
+    if "model_family" not in normalized.columns:
+        normalized["model_family"] = ""
+    if "loss_name" not in normalized.columns:
+        normalized["loss_name"] = ""
+    if "created_at" not in normalized.columns:
+        normalized["created_at"] = ""
+
+    for column in SUMMARY_COLUMNS:
+        if column not in normalized.columns:
+            normalized[column] = np.nan
+
+    return normalized[SUMMARY_COLUMNS]
+
+
+def load_existing_summary(summary_path):
+    if not summary_path.exists():
+        return pd.DataFrame(columns=SUMMARY_COLUMNS)
+
+    try:
+        existing_df = pd.read_csv(summary_path)
+    except pd.errors.EmptyDataError:
+        return pd.DataFrame(columns=SUMMARY_COLUMNS)
+
+    return normalize_existing_summary(existing_df)
+
+
+def append_summary(summary_path, new_rows_df):
+    existing_df = load_existing_summary(summary_path)
+    if existing_df.empty:
+        combined_df = new_rows_df.copy()
+    else:
+        combined_df = pd.concat([existing_df, new_rows_df], ignore_index=True)
+    combined_df = combined_df[SUMMARY_COLUMNS]
+
     summary_path.parent.mkdir(parents=True, exist_ok=True)
-    summary_df.to_csv(summary_path, index=False)
-    print(f"\n💾 Saved summary to {summary_path}")
-    print("\n=== Summary ===")
-    print(summary_df.to_string(index=False))
+    tmp_path = summary_path.with_name(f"{summary_path.name}.tmp")
+    combined_df.to_csv(tmp_path, index=False)
+    tmp_path.replace(summary_path)
+    return combined_df
 
 
-parser = argparse.ArgumentParser(description="Compare benchmark prediction results across models")
-parser.add_argument("--train-trajs", type=str, default='["random", "square", "chirp"]')
-parser.add_argument("--test-trajs", type=str, default='["melon"]')
-parser.add_argument("--predictions-dir", type=str, default=str(PROJECT_ROOT / "out" / "predictions"))
-parser.add_argument("--max-horizon", type=int, default=50)
-parser.add_argument("--show-plots", action="store_true")
-parser.add_argument("--summary-path", type=str, default=str(PROJECT_ROOT / "out" / "benchmark_summary.csv"))
-parser.add_argument("--manifest-path", type=str, default=None, help="Optional batch manifest for full-12 summary mode")
-parser.add_argument("--expected-count", type=int, default=None, help="Optional expected number of completed experiments in manifest mode")
-args = parser.parse_args()
+def print_latex_summary(evaluated_experiments, max_horizon):
+    target_horizons = [1, 10, min(50, max_horizon)]
+    latex_rows = []
 
-setup_matplotlib()
+    for experiment in evaluated_experiments:
+        metrics = experiment["metrics"]
+        sim_p, sim_v, sim_r, sim_w = compute_simerr(metrics)
+        latex_rows.append(
+            [
+                experiment["model_label"],
+                metrics["pos"][1],
+                metrics["pos"][10],
+                metrics["pos"][target_horizons[-1]],
+                sim_p,
+                metrics["vel"][1],
+                metrics["vel"][10],
+                metrics["vel"][target_horizons[-1]],
+                sim_v,
+                metrics["rot"][1],
+                metrics["rot"][10],
+                metrics["rot"][target_horizons[-1]],
+                sim_r,
+                metrics["omega"][1],
+                metrics["omega"][10],
+                metrics["omega"][target_horizons[-1]],
+                sim_w,
+            ]
+        )
 
-train_trajs = json.loads(args.train_trajs)
-test_trajs = json.loads(args.test_trajs)
-predictions_dir = Path(args.predictions_dir)
-summary_path = Path(args.summary_path)
-summary_path.parent.mkdir(parents=True, exist_ok=True)
+    print_latex_table_results(latex_rows, target_horizons)
 
-if args.max_horizon < 50:
-    raise ValueError("--max-horizon must be at least 50 for the fixed *_h50 summary columns")
 
-if args.manifest_path is not None:
-    summarize_manifest(
-        manifest_path=Path(args.manifest_path),
-        summary_path=summary_path,
-        max_horizon=args.max_horizon,
-        expected_count=args.expected_count,
+def show_metric_plots(evaluated_experiments):
+    fig, axs = plt.subplots(1, 4, figsize=(12, 2.5), sharex=True)
+    metric_names = ["pos", "vel", "rot", "omega"]
+    ylabels = [
+        r"$\mathrm{MAE}_{e_p,h}$  [m]",
+        r"$\mathrm{MAE}_{e_v,h}$  [m/s]",
+        r"$\mathrm{MAE}_{e_R,h}$  [rad]",
+        r"$\mathrm{MAE}_{e_{\omega},h}$  [rad/s]",
+    ]
+    colors = plt.get_cmap("tab10").colors
+
+    for idx, metric in enumerate(metric_names):
+        ax = axs[idx]
+        for exp_idx, experiment in enumerate(evaluated_experiments):
+            metrics = experiment["metrics"][metric]
+            horizons = np.array(sorted(metrics.keys()))
+            values = np.array([metrics[h] for h in horizons])
+            ax.plot(
+                horizons,
+                values,
+                linewidth=2,
+                color=colors[exp_idx % len(colors)],
+                label=experiment["model_label"],
+            )
+        ax.set_ylabel(ylabels[idx], fontsize=12)
+        ax.set_xlabel("$h$  [-]", fontsize=12)
+        ax.grid(True, alpha=0.3)
+
+    handles, labels = axs[0].get_legend_handles_labels()
+    fig.legend(
+        handles,
+        labels,
+        loc="upper center",
+        ncols=max(1, min(len(labels), 5)),
+        bbox_to_anchor=(0.5, 1.12),
+        fontsize=11,
     )
-    sys.exit(0)
+    plt.subplots_adjust(top=0.82, bottom=0.18, wspace=0.35)
+    plt.show()
 
-train_name = "_".join(train_trajs)
-test_name = "_".join(test_trajs)
 
-file_lstm = predictions_dir / f"lstm_{train_name}_model_multistep" / f"{test_name}_multistep.csv"
-file_base = predictions_dir / "baseline_model_multistep" / f"{test_name}_multistep.csv"
-file_residual = predictions_dir / f"residual_{train_name}_model_multistep" / f"{test_name}_multistep.csv"
-file_phys = predictions_dir / "physics_model_multistep" / f"{test_name}_multistep.csv"
-file_physres = predictions_dir / f"phys+res_{train_name}_model_multistep" / f"{test_name}_multistep.csv"
+def show_prediction_plots(evaluated_experiments, horizon):
+    reference_df = evaluated_experiments[0]["df_pred"]
+    max_available = max(len(reference_df) - horizon, 1)
+    n_start = min(2000, max_available - 1)
+    n_end = min(n_start + 500, max_available)
+    if n_end <= n_start:
+        n_start = 0
+        n_end = max_available
 
-print("LSTM file path:", file_lstm)
-print("Baseline file path:", file_base)
+    state_names = [
+        "x",
+        "y",
+        "z",
+        "roll",
+        "pitch",
+        "yaw",
+        "vx",
+        "vy",
+        "vz",
+        "wx",
+        "wy",
+        "wz",
+    ]
+    state_labels = [
+        [r"$x$ [m]", r"$y$ [m]", r"$z$ [m]"],
+        [r"$\varphi$ [rad]", r"$\theta$ [rad]", r"$\psi$ [rad]"],
+        [r"$v_x$ [m/s]", r"$v_y$ [m/s]", r"$v_z$ [m/s]"],
+        [r"$\omega_x$ [rad/s]", r"$\omega_y$ [rad/s]", r"$\omega_z$ [rad/s]"],
+    ]
 
-df_lstm = require_csv(file_lstm)
-df_base = require_csv(file_base)
-df_residual = require_csv(file_residual)
-df_phys = require_csv(file_phys)
-df_physres = require_csv(file_physres)
+    fig, axs = plt.subplots(4, 3, figsize=(12, 5), sharex=True, dpi=200)
+    t = reference_df["t"].values
+    colors = plt.get_cmap("tab10").colors
 
-print("✅ Loaded datasets:")
-print(f"  LSTM model: {df_lstm.shape}")
-print(f"  Baseline model: {df_base.shape}")
-print(f"  Residual model: {df_residual.shape}")
-print(f"  Physics model: {df_phys.shape}")
-print(f"  Phys+Res model: {df_physres.shape}")
+    for r in range(4):
+        for c in range(3):
+            idx = r * 3 + c
+            state = state_names[idx]
+            pred_col = f"{state}_pred_h{horizon}"
+            ax = axs[r, c]
 
-df_base, df_lstm, df_residual, df_phys, df_physres = [
-    add_rotation_columns(df)
-    for df in [df_base, df_lstm, df_residual, df_phys, df_physres]
-]
+            true = (
+                reference_df[state][n_start + horizon : n_end + horizon]
+                .rolling(20, min_periods=1, center=True)
+                .mean()
+            )
 
-metrics_base = compute_errors(df_base, args.max_horizon)
-metrics_lstm = compute_errors(df_lstm, args.max_horizon)
-metrics_residual = compute_errors(df_residual, args.max_horizon)
-metrics_phys = compute_errors(df_phys, args.max_horizon)
-metrics_physres = compute_errors(df_physres, args.max_horizon)
+            for exp_idx, experiment in enumerate(evaluated_experiments):
+                pred = (
+                    experiment["df_pred"][pred_col][n_start:n_end]
+                    .rolling(20, min_periods=1, center=True)
+                    .mean()
+                )
+                ax.plot(
+                    t[n_start + horizon : n_end + horizon],
+                    pred,
+                    linewidth=1.2,
+                    color=colors[exp_idx % len(colors)],
+                    label=experiment["model_label"],
+                )
 
-model_metrics = {
-    "Naïve": metrics_base,
-    "Physics": metrics_phys,
-    "Residual": metrics_residual,
-    "Phys+Res": metrics_physres,
-    "LSTM": metrics_lstm,
-}
+            ax.plot(
+                t[n_start + horizon : n_end + horizon],
+                true,
+                "k--",
+                linewidth=1.5,
+                label="GT",
+            )
+            ax.set_ylabel(state_labels[r][c], fontsize=12)
+            ax.grid(True, alpha=0.3)
 
-if args.show_plots:
-    plot_metrics(model_metrics, save_fig=False)
+            if r == 3 and c == 1:
+                ax.set_xlabel("Time [s]", fontsize=12)
 
-    dfs = {
-        "Naive": df_base,
-        "Physics": df_phys,
-        "Residual": df_residual,
-        "Phys+Res": df_physres,
-        "LSTM": df_lstm,
-    }
-    n_start = 2000
-    n_end = n_start + 500
-    plot_multistate_predictions(dfs, h=min(50, args.max_horizon), N_start=n_start, N_end=n_end)
+    handles, labels = [], []
+    for ax in axs.flat:
+        h, l = ax.get_legend_handles_labels()
+        for handle, label in zip(h, l):
+            if label not in labels:
+                handles.append(handle)
+                labels.append(label)
 
-summary_rows = []
-latex_rows = []
-target_horizons = [1, 10, min(50, args.max_horizon)]
-model_order = ["Naïve", "Physics", "Residual", "Phys+Res", "LSTM"]
+    fig.legend(
+        handles,
+        labels,
+        loc="upper center",
+        ncols=max(1, min(len(labels), 6)),
+        bbox_to_anchor=(0.5, 1.0),
+        fontsize=11,
+    )
+    plt.subplots_adjust(top=0.84, bottom=0.12, hspace=0.28, wspace=0.35)
+    plt.show()
 
-for model_name in model_order:
-    mm = model_metrics[model_name]
-    sim_p, sim_v, sim_r, sim_w = compute_simerr(mm)
 
-    summary_row = build_summary_row(model_name, mm)
-    summary_row["pos_h50"] = mm["pos"][target_horizons[-1]]
-    summary_row["vel_h50"] = mm["vel"][target_horizons[-1]]
-    summary_row["rot_h50"] = mm["rot"][target_horizons[-1]]
-    summary_row["omega_h50"] = mm["omega"][target_horizons[-1]]
-    summary_rows.append(summary_row)
+def maybe_show_plots(evaluated_experiments, max_horizon):
+    setup_matplotlib()
+    show_metric_plots(evaluated_experiments)
+    show_prediction_plots(evaluated_experiments, horizon=min(50, max_horizon))
 
-    latex_rows.append([
-        model_name,
-        mm["pos"][1], mm["pos"][10], mm["pos"][target_horizons[-1]], sim_p,
-        mm["vel"][1], mm["vel"][10], mm["vel"][target_horizons[-1]], sim_v,
-        mm["rot"][1], mm["rot"][10], mm["rot"][target_horizons[-1]], sim_r,
-        mm["omega"][1], mm["omega"][10], mm["omega"][target_horizons[-1]], sim_w,
-    ])
 
-summary_df = pd.DataFrame(summary_rows)
-summary_df.to_csv(summary_path, index=False)
-print(f"\n💾 Saved summary to {summary_path}")
-print("\n=== Summary ===")
-print(summary_df.to_string(index=False))
+def main(argv=None):
+    args = parse_args(argv)
+    experiments = build_experiments(args)
+    evaluated_experiments = evaluate_experiments(experiments, args.max_horizon)
 
-print_latex_table_results(latex_rows, target_horizons)
+    created_at = datetime.now().astimezone().isoformat(timespec="seconds")
+    new_rows_df = build_summary_df(evaluated_experiments, created_at=created_at)
+    summary_path = Path(args.summary_path).expanduser().resolve()
+    combined_df = append_summary(summary_path, new_rows_df)
+
+    print(f"\n💾 Appended {len(new_rows_df)} row(s) to {summary_path}")
+    print("\n=== Newly Appended Rows ===")
+    print(new_rows_df.to_string(index=False))
+    print(f"\n📚 Total rows in summary: {len(combined_df)}")
+
+    print_latex_summary(evaluated_experiments, args.max_horizon)
+
+    if args.show_plots:
+        maybe_show_plots(evaluated_experiments, args.max_horizon)
+
+    return combined_df
+
+
+if __name__ == "__main__":
+    main()

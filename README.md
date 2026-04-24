@@ -136,7 +136,7 @@ python train/train_phys+res.py
 
 ### 2. Testing
 
-The `test/` directory contains scripts to evaluate trained models over test trajectories. Predictions are saved in `results/`
+The `test/` directory contains scripts to evaluate trained models over test trajectories. Predictions are saved in `out/predictions/`.
 
 Example: Test LSTM model
 ```bash
@@ -145,11 +145,19 @@ python test/test_lstm.py
 
 ### 3. Comparison & Results
 
-Use `results/model_comparison.py` or `results/model_comparison.ipynb` to compare different models and generate plots.
+Use `results/model_comparison.py` to compute metrics from one or more explicit prediction CSVs and append them to a summary table.
 
+Example: append one experiment to `out/prompts.csv`
 ```bash
-python results/model_comparison.py
+python results/model_comparison.py \
+  --prediction-csv out/predictions/physres__lag_gru__mixed_early_demo_model_multistep/melon_multistep.csv \
+  --model-label lag_gru_mixed_early_demo \
+  --model-family lag_gru \
+  --loss-name mixed_early \
+  --summary-path out/prompts.csv
 ```
+
+Repeat `--prediction-csv`, `--model-label`, `--model-family`, and `--loss-name` in the same order to compare multiple experiments in one run. Each invocation appends new rows to the target summary CSV and automatically fills a `created_at` timestamp column.
 
 ### 4. Model Export & Profiling
 
@@ -166,36 +174,6 @@ The process to benchmark the execution time is as follows:
 * Select the _Balance between RAM size and inference time_ mode
 * Profile on the _STM32F469I-DISCO_ board, which matches the Crazyflie's STM32F405 in terms of CPU micro-architecture and memory hierarchy
 * Rescale the profiled execution times to account for the different clock rates (180MHz vs 168MHz, respectively)
-
-### 5. Full-12 Batch Run on Linux
-
-To run the full set of 12 unique `model+loss` experiments on a Linux machine and summarize them into a single CSV:
-
-```bash
-bash run_full12.sh --stamp full12_$(date +%Y%m%d_%H%M%S)
-```
-
-This runner:
-
-- trains each experiment sequentially with W&B logging enabled
-- evaluates each checkpoint immediately after training
-- refreshes `out/benchmark_summary_full12.csv` after each completed experiment
-- writes per-experiment logs under `out/logs/<stamp>/`
-- stores a manifest under `out/manifests/<stamp>.json`
-- performs a final completeness check on `out/benchmark_summary_full12.csv` via the existing `results/model_comparison.py` script in manifest mode
-
-For a quick smoke test on a single experiment:
-
-```bash
-bash run_full12.sh --stamp smoke_$(date +%Y%m%d_%H%M%S) --only residual_weighted_mse --epochs 1
-```
-
-The batch runner is designed to be used from `tmux`, for example:
-
-```bash
-tmux new -s nd_full12
-bash run_full12.sh --stamp full12_$(date +%Y%m%d_%H%M%S)
-```
 
 ## Official benchmark evaluation
 
