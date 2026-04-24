@@ -349,40 +349,31 @@ def compute_loss(model, criterion, batch, device, loss_config):
     x0 = x0.to(device, non_blocking=True)
     u_seq = u_seq.to(device, non_blocking=True)
     true_seq = true_seq.to(device, non_blocking=True)
-    history_kwargs = {}
-    if getattr(model, "use_hist_init", False):
-        if len(batch) < 5:
-            raise ValueError("History-initialized models require x_hist and u_hist in the batch")
-        history_kwargs["x_hist"] = batch[3].to(device, non_blocking=True)
-        history_kwargs["u_hist"] = batch[4].to(device, non_blocking=True)
+    x_hist = batch[3] if len(batch) >= 5 else None
+    u_hist = batch[4] if len(batch) >= 5 else None
+    if x_hist is not None:
+        x_hist = x_hist.to(device, non_blocking=True)
+        u_hist = u_hist.to(device, non_blocking=True)
 
-    aux_seq = None
-    if loss_config.use_aux:
-        aux_index = 5 if history_kwargs else 3
-        if len(batch) <= aux_index:
-            raise ValueError("Auxiliary supervision requires aux targets in the batch")
-        aux_seq = batch[aux_index].to(device, non_blocking=True)
+    aux_seq = (
+        batch[3].to(device, non_blocking=True)
+        if len(batch) == 4
+        else None
+    )
 
     aux_pred = None
     force_pred_seq = None
     u_eff_seq_real = None
 
     if loss_config.use_force:
-        pred_seq, force_pred_seq, u_eff_seq_real = model(
-            x0,
-            u_seq,
-            return_force=True,
-            **history_kwargs,
-        )
+        pred_seq, force_pred_seq, u_eff_seq_real = model(x0, u_seq, return_force=True)
     elif loss_config.use_aux:
-        pred_seq, aux_pred = model(
-            x0,
-            u_seq,
-            return_aux=True,
-            **history_kwargs,
-        )
+        pred_seq, aux_pred = model(x0, u_seq, return_aux=True)
     else:
-        pred_seq = model(x0, u_seq, **history_kwargs)
+        if x_hist is not None:
+            pred_seq = model(x0, u_seq, x_hist=x_hist, u_hist=u_hist)
+        else:
+            pred_seq = model(x0, u_seq)
 
     total_loss, loss_dict = criterion(
         pred_seq,

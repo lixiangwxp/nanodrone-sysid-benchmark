@@ -88,6 +88,7 @@ class QuadDataset(Dataset):
             raise ValueError("start_offset must be >= 0")
 
         self.history_len = history_len
+        self.start_offset = start_offset
         self.has_history = history_len > 0
 
         xs, us_seq, xs_seq = [], [], []
