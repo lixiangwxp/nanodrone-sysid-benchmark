@@ -101,12 +101,14 @@ The `main` branch focuses on the PyTorch-based identification models, training, 
 - Python 3.8+
 - CUDA-capable GPU (recommended for training)
 
-### Step 1: Install Dependencies
+### Step 1: Initialize Submodule and Install Dependencies
 
-Install the standard requirements:
+The repository bundles the official benchmark integration as the `nonlinear_benchmarks` submodule. Initialize it and install both the main requirements and the editable benchmark package:
 
 ```bash
+git submodule update --init --recursive
 pip install -r requirements.txt
+pip install -e ./nonlinear_benchmarks
 ```
 
 ### Step 2: Install PyTorch3D
@@ -194,6 +196,10 @@ The batch runner is designed to be used from `tmux`, for example:
 tmux new -s nd_full12
 bash run_full12.sh --stamp full12_$(date +%Y%m%d_%H%M%S)
 ```
+
+## Official benchmark evaluation
+
+This repository includes the `nonlinear_benchmarks` submodule for the official benchmark dataloader and submission workflow. The main training and evaluation protocol used by this repository remains the current `train/`, `test/`, and `results/` workflow and should not be changed to match the benchmark interface. `official_eval/run_nanodrone_official.py` is intentionally provided as a scaffold / placeholder rather than a turnkey end-to-end evaluation script. Treat the official benchmark route and the main repository protocol as parallel workflows, and do not use benchmark test data for model selection or hyperparameter tuning.
 
 ## Models Description
 
