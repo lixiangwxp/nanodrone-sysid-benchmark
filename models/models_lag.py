@@ -325,6 +325,8 @@ class LagPhysResGRUModel(LagPhysResQuadModel):
         alpha_init=0.85,
         hidden_dim=64,
         alpha_dim=1,
+        use_u_init=False,
+        u_init_scale=0.05,
     ):
         nn.Module.__init__(self)
 
@@ -344,6 +346,8 @@ class LagPhysResGRUModel(LagPhysResQuadModel):
             param.requires_grad_(False)
         self.gru_hidden_dim = hidden_dim
         self.alpha_dim = int(alpha_dim)
+        self.use_u_init = bool(use_u_init)
+        self.u_init_scale = float(u_init_scale)
         if self.alpha_dim not in (1, 4):
             raise ValueError("alpha_dim must be 1 or 4")
 
@@ -368,6 +372,17 @@ class LagPhysResGRUModel(LagPhysResQuadModel):
         self.register_buffer("x_scale", x_scale)
         self.register_buffer("u_mean", u_mean)
         self.register_buffer("u_scale", u_scale)
+
+        if self.use_u_init:
+            self.u_init_head = nn.Sequential(
+                nn.Linear(state_dim + control_dim, hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, control_dim),
+            )
+            nn.init.zeros_(self.u_init_head[-1].weight)
+            nn.init.zeros_(self.u_init_head[-1].bias)
+        else:
+            self.u_init_head = None
 
         
         #h，形状 (B, hidden_dim)
@@ -410,7 +425,17 @@ class LagPhysResGRUModel(LagPhysResQuadModel):
         preds = []
         # 从当前状态生成初始记忆h；执行器内部状态用第一步控制作seed。
         h = self.h_init(x_norm)
-        u_eff_prev_real = self.u_denorm(u_seq[:, 0, :])
+        u0_norm = u_seq[:, 0, :]
+
+        # Optional learned initialization of the effective actuator state.
+        # Zero-initialized head makes this path initially identical to u_eff0 = u0.
+        if self.use_u_init:
+            init_feat = torch.cat([x_norm, u0_norm], dim=-1)
+            delta_u0_norm = self.u_init_scale * torch.tanh(self.u_init_head(init_feat))
+            u_eff0_norm = u0_norm + delta_u0_norm
+            u_eff_prev_real = self.u_denorm(u_eff0_norm)
+        else:
+            u_eff_prev_real = self.u_denorm(u0_norm)
 
         for t in range(horizon):
             '''1取当前raw电机指令'''
