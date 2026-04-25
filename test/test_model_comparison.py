@@ -1,12 +1,14 @@
 import os
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
+os.environ.setdefault("MPLBACKEND", "Agg")
+
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-
-os.environ.setdefault("MPLBACKEND", "Agg")
 
 from results import model_comparison
 
@@ -71,6 +73,17 @@ def build_prediction_df(num_rows=60, scale=1.0):
             data[f"{state}_pred_h{horizon}"] = pd.Series(base_values[state]).shift(-(horizon - 1))
 
     return pd.DataFrame(data)
+
+
+def build_target_time_prediction_df(num_rows=80, t_offset=0.0, scale=1.0):
+    df = build_prediction_df(num_rows=num_rows, scale=scale)
+    df["t"] = df["t"] + t_offset
+
+    for horizon in range(1, 51):
+        for state in STATE_COLUMNS:
+            df[f"{state}_pred_h{horizon}"] = pd.Series(df[state]).shift(-horizon)
+
+    return model_comparison.add_rotation_columns(df)
 
 
 class ModelComparisonCLITests(unittest.TestCase):
@@ -194,6 +207,74 @@ class ModelComparisonCLITests(unittest.TestCase):
         for plot_path in expected_plots:
             self.assertTrue(plot_path.is_file())
             self.assertGreater(plot_path.stat().st_size, 0)
+
+    def test_prediction_plot_frame_uses_target_time_for_horizon(self):
+        df = build_target_time_prediction_df(num_rows=80, t_offset=0.2)
+        horizon = 10
+
+        plot_frame = model_comparison.build_prediction_plot_frame(df, "x", horizon)
+
+        self.assertEqual(len(plot_frame), len(df) - horizon)
+        self.assertAlmostEqual(plot_frame.iloc[0]["target_time"], df["t"].iloc[horizon])
+        self.assertAlmostEqual(plot_frame.iloc[0]["true"], df["x"].iloc[horizon])
+        self.assertAlmostEqual(plot_frame.iloc[0]["pred"], df["x"].iloc[horizon])
+
+    def test_prediction_time_window_prefers_twenty_to_twenty_five_seconds(self):
+        target_time = np.arange(0.0, 30.0, 0.01)
+
+        window_start, window_end = model_comparison.select_prediction_time_window(target_time)
+
+        self.assertEqual((window_start, window_end), (20.0, 25.0))
+
+    def test_prediction_time_window_falls_back_to_middle_five_seconds(self):
+        target_time = np.arange(0.0, 10.0, 0.01)
+
+        window_start, window_end = model_comparison.select_prediction_time_window(target_time)
+
+        self.assertAlmostEqual(window_start, 2.495)
+        self.assertAlmostEqual(window_end, 7.495)
+
+    def test_prediction_plot_uses_each_experiment_target_time(self):
+        horizon = 3
+        baseline_df = build_target_time_prediction_df(num_rows=120, t_offset=0.0)
+        history_df = build_target_time_prediction_df(num_rows=100, t_offset=0.2)
+        evaluated = [
+            {"df_pred": baseline_df, "model_label": "baseline"},
+            {"df_pred": history_df, "model_label": "history_offset"},
+        ]
+
+        with mock.patch("matplotlib.pyplot.show"):
+            model_comparison.show_prediction_plots(evaluated, horizon=horizon, show=True)
+
+        ax = plt.gcf().axes[0]
+        lines_by_label = {line.get_label(): line for line in ax.lines}
+        baseline_x = lines_by_label["baseline"].get_xdata()
+        history_x = lines_by_label["history_offset"].get_xdata()
+
+        self.assertAlmostEqual(baseline_x[0], baseline_df["t"].iloc[horizon])
+        self.assertAlmostEqual(history_x[0], history_df["t"].iloc[horizon])
+        self.assertNotAlmostEqual(baseline_x[0], history_x[0])
+        plt.close("all")
+
+    def test_prediction_plot_handles_shorter_offset_csv(self):
+        horizon = 3
+        baseline_df = build_target_time_prediction_df(num_rows=140, t_offset=0.0)
+        shorter_df = build_target_time_prediction_df(num_rows=80, t_offset=0.5)
+        evaluated = [
+            {"df_pred": baseline_df, "model_label": "baseline"},
+            {"df_pred": shorter_df, "model_label": "shorter_offset"},
+        ]
+
+        with mock.patch("matplotlib.pyplot.show"):
+            model_comparison.show_prediction_plots(evaluated, horizon=horizon, show=True)
+
+        ax = plt.gcf().axes[0]
+        lines_by_label = {line.get_label(): line for line in ax.lines}
+        shorter_line = lines_by_label["shorter_offset"]
+
+        self.assertEqual(len(shorter_line.get_xdata()), len(shorter_line.get_ydata()))
+        self.assertAlmostEqual(shorter_line.get_xdata()[0], shorter_df["t"].iloc[horizon])
+        plt.close("all")
 
     def test_existing_summary_without_created_at_is_preserved(self):
         summary_path = self.tmp_path / "legacy_summary.csv"

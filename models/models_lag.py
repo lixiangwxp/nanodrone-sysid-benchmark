@@ -333,6 +333,8 @@ class LagPhysResGRUModel(LagPhysResQuadModel):
         actbank_use_history=False,
         actbank_taus_ms=(20.0, 50.0, 100.0, 200.0),
         actbank_alpha_scale=0.1,
+        use_hist_rotres=False,
+        hist_rotres_scale=0.02,
     ):
         nn.Module.__init__(self)
 
@@ -360,7 +362,13 @@ class LagPhysResGRUModel(LagPhysResQuadModel):
         self.actbank_use_history = bool(actbank_use_history)
         self.actbank_alpha_scale = float(actbank_alpha_scale)
         self.actbank_taus_ms = tuple(float(tau_ms) for tau_ms in actbank_taus_ms)
-        self.requires_history = bool(self.use_hist_init or self.actbank_use_history)
+        self.use_hist_rotres = bool(use_hist_rotres)
+        self.hist_rotres_scale = float(hist_rotres_scale)
+        self.requires_history = bool(
+            self.use_hist_init
+            or self.actbank_use_history
+            or self.use_hist_rotres
+        )
         if self.alpha_dim not in (1, 4):
             raise ValueError("alpha_dim must be 1 or 4")
         if self.use_actbank_alpha and self.alpha_dim != 1:
@@ -435,6 +443,24 @@ class LagPhysResGRUModel(LagPhysResQuadModel):
         else:
             self.actbank_lambdas = None
             self.actbank_alpha_head = None
+
+        if self.use_hist_rotres:
+            self.hist_rot_encoder = nn.GRU(
+                input_size=state_dim + control_dim,
+                hidden_size=hidden_dim,
+                batch_first=True,
+            )
+            rotres_feat_dim = hidden_dim + hidden_dim + 6 + 3 * control_dim
+            self.hist_rotres_head = nn.Sequential(
+                nn.Linear(rotres_feat_dim, hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, 6),
+            )
+            nn.init.zeros_(self.hist_rotres_head[-1].weight)
+            nn.init.zeros_(self.hist_rotres_head[-1].bias)
+        else:
+            self.hist_rot_encoder = None
+            self.hist_rotres_head = None
 
         
         #h，形状 (B, hidden_dim)
@@ -537,6 +563,28 @@ class LagPhysResGRUModel(LagPhysResQuadModel):
             )
             h = h + delta_h
 
+        if self.use_hist_rotres:
+            if x_hist is None or u_hist is None:
+                raise ValueError("x_hist and u_hist are required when use_hist_rotres=True")
+            if x_hist.ndim != 3 or u_hist.ndim != 3:
+                raise ValueError("x_hist and u_hist must be 3D tensors")
+            if x_hist.shape[0] != x_norm.shape[0] or u_hist.shape[0] != x_norm.shape[0]:
+                raise ValueError("history batch size mismatch")
+            if x_hist.shape[-1] != x_norm.shape[-1]:
+                raise ValueError("x_hist last dimension must match state dim")
+            if u_hist.shape[-1] != u_seq.shape[-1]:
+                raise ValueError("u_hist last dimension must match control dim")
+            if x_hist.shape[1] != u_hist.shape[1] + 1:
+                raise ValueError("x_hist must have length L+1 and u_hist length L")
+            if not torch.allclose(x_hist[:, -1, :], x_norm, atol=1e-6, rtol=1e-6):
+                raise ValueError("x_hist must end at x0")
+
+            hist_rot_input = torch.cat([x_hist[:, :-1, :], u_hist], dim=-1)
+            _, hist_rot_hidden = self.hist_rot_encoder(hist_rot_input)
+            c_hist_rot = hist_rot_hidden[-1]
+        else:
+            c_hist_rot = None
+
         u0_norm = u_seq[:, 0, :]
 
         # Optional learned initialization of the effective actuator state.
@@ -608,6 +656,25 @@ class LagPhysResGRUModel(LagPhysResQuadModel):
             # 残差网络学习 physics 未覆盖的修正量，再和物理预测相加。
             residual_in = self._pack_gru_features(x_norm, u_raw_norm, u_eff_norm, h)
             dx_res = self.residual.out(self.residual.mlp(residual_in))
+
+            if self.use_hist_rotres:
+                rotres_feat = torch.cat(
+                    [
+                        c_hist_rot,
+                        h,
+                        x_norm[:, 6:12],
+                        u_raw_norm,
+                        u_eff_norm,
+                        u_raw_norm - u_eff_norm,
+                    ],
+                    dim=-1,
+                )
+                delta_rotomega = self.hist_rotres_scale * torch.tanh(
+                    self.hist_rotres_head(rotres_feat)
+                )
+                dx_res = dx_res.clone()
+                dx_res[:, 6:12] = dx_res[:, 6:12] + delta_rotomega
+
             x_next_norm = x_phys_next_norm + dx_res
 
             # 若残差分支数值炸掉，则退回纯 physics 预测，保证 rollout 可继续。

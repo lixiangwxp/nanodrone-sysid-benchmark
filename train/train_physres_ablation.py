@@ -43,7 +43,7 @@ from utils.wandb_utils import (
 )
 
 
-VARIANT_CHOICES = ["baseline", "geo", "lag", "lag_gru", "lag_gru_uinit", "lag_gru_histinit_honly", "lag_gru_actbank_alphaonly", "lag_gru_alpha4", "lag_gru_ctrl", "lag_gru_torque", "lag_gru_force", "lag_geo", "full"]
+VARIANT_CHOICES = ["baseline", "geo", "lag", "lag_gru", "lag_gru_uinit", "lag_gru_histinit_honly", "lag_gru_histrotres", "lag_gru_actbank_alphaonly", "lag_gru_alpha4", "lag_gru_ctrl", "lag_gru_torque", "lag_gru_force", "lag_geo", "full"]
 DEFAULT_AUX_COLS_RAW = '["az_body"]'
 DEFAULT_FORCE_AUX_COLS = ["ax_body", "ay_body", "az_body"]
 
@@ -65,7 +65,7 @@ def parse_taus_ms(raw_value):
 
 
 def uses_lag(variant):
-    return variant in {"lag", "lag_gru", "lag_gru_uinit", "lag_gru_histinit_honly", "lag_gru_actbank_alphaonly", "lag_gru_alpha4", "lag_gru_ctrl", "lag_gru_torque", "lag_gru_force", "lag_geo", "full"}
+    return variant in {"lag", "lag_gru", "lag_gru_uinit", "lag_gru_histinit_honly", "lag_gru_histrotres", "lag_gru_actbank_alphaonly", "lag_gru_alpha4", "lag_gru_ctrl", "lag_gru_torque", "lag_gru_force", "lag_geo", "full"}
 
 
 def uses_geo_loss(variant):
@@ -89,7 +89,7 @@ def uses_hist_init(variant):
 
 
 def uses_history(variant):
-    return variant in {"lag_gru_histinit_honly", "lag_gru_actbank_alphaonly"}
+    return variant in {"lag_gru_histinit_honly", "lag_gru_actbank_alphaonly", "lag_gru_histrotres"}
 
 def build_model_name(variant, train_trajs, loss_type="exp", name_suffix=""):
     parts = ["physres", variant]
@@ -167,9 +167,10 @@ def build_model(
     hist_init_scale,
     actbank_taus_ms,
     actbank_alpha_scale,
+    hist_rotres_scale,
 ):
     num_layers = 5
-    if variant in {"lag_gru", "lag_gru_uinit", "lag_gru_histinit_honly", "lag_gru_actbank_alphaonly", "lag_gru_alpha4", "lag_gru_ctrl", "lag_gru_torque", "lag_gru_force"}:
+    if variant in {"lag_gru", "lag_gru_uinit", "lag_gru_histinit_honly", "lag_gru_histrotres", "lag_gru_actbank_alphaonly", "lag_gru_alpha4", "lag_gru_ctrl", "lag_gru_torque", "lag_gru_force"}:
         residual_input_dim = gru_hidden_dim + 12
         #对 lag_gru 相关的模型，残差网络看的是：GRU 隐状态（gru_hidden_dim维）和原始控制相关的12维量（u_raw：4维，u_eff：4维，u_raw - u_eff：4维），合起来就是 gru_hidden_dim + 12 维
         #GRU 隐状态 h 可以理解成一个“学出来的记忆向量”，
@@ -249,6 +250,25 @@ def build_model(
             actbank_use_history=True,
             actbank_taus_ms=actbank_taus_ms,
             actbank_alpha_scale=actbank_alpha_scale,
+        )
+    elif variant == "lag_gru_histrotres":
+        model = LagPhysResGRUModel(
+            phys=phys_model,
+            residual=residual_model,
+            x_scaler=x_scaler,
+            u_scaler=u_scaler,
+            lag_mode=lag_mode,
+            alpha_init=alpha_init,
+            hidden_dim=gru_hidden_dim,
+            alpha_dim=1,
+            use_u_init=False,
+            u_init_scale=0.05,
+            use_hist_init=False,
+            hist_init_scale=0.1,
+            use_actbank_alpha=False,
+            actbank_use_history=False,
+            use_hist_rotres=True,
+            hist_rotres_scale=hist_rotres_scale,
         )
     elif variant == "lag_gru_alpha4":
         model = LagPhysResGRUModel(
@@ -377,7 +397,7 @@ def build_autocast_context(device, enabled):
 #配置怎么更新参数
 def build_optimizer(model, variant, base_lr):
     weight_decay = 1e-5
-    if variant not in {"lag_gru", "lag_gru_uinit", "lag_gru_histinit_honly", "lag_gru_actbank_alphaonly", "lag_gru_alpha4", "lag_gru_ctrl", "lag_gru_torque", "lag_gru_force"}:
+    if variant not in {"lag_gru", "lag_gru_uinit", "lag_gru_histinit_honly", "lag_gru_histrotres", "lag_gru_actbank_alphaonly", "lag_gru_alpha4", "lag_gru_ctrl", "lag_gru_torque", "lag_gru_force"}:
         return optim.Adam(model.parameters(), lr=base_lr, weight_decay=weight_decay)
 
     grouped_ids = set()
@@ -399,10 +419,12 @@ def build_optimizer(model, variant, base_lr):
     fast_params.extend(collect_params(getattr(model, "hist_h_head", None)))
     fast_params.extend(collect_params(getattr(model, "alpha_head", None)))
     fast_params.extend(collect_params(getattr(model, "actbank_alpha_head", None)))
+    fast_params.extend(collect_params(getattr(model, "hist_rotres_head", None)))
 
     #“中等学习率”的参数组
     medium_params = collect_params(getattr(model, "gru_cell", None))
     medium_params.extend(collect_params(getattr(model, "hist_encoder", None)))
+    medium_params.extend(collect_params(getattr(model, "hist_rot_encoder", None)))
     medium_params.extend(collect_params(getattr(model, "control_encoder", None)))
     medium_params.extend(collect_params(getattr(model, "ctx_h0_adapter", None)))
     medium_params.extend(collect_params(getattr(model, "ctx_step_adapter", None)))
@@ -469,8 +491,10 @@ def build_checkpoint(
     hist_init_scale,
     actbank_taus_ms,
     actbank_alpha_scale,
+    hist_rotres_scale,
     init_from,
     freeze_non_torque,
+    freeze_base_except_new_head,
     amp_enabled,
     scaler_dir,
     train_trajs,
@@ -507,7 +531,7 @@ def build_checkpoint(
             "lr_end": lr_end,
             "batch_size": batch_size,
             "gru_hidden_dim": (
-                gru_hidden_dim if variant in {"lag_gru", "lag_gru_uinit", "lag_gru_histinit_honly", "lag_gru_actbank_alphaonly", "lag_gru_alpha4", "lag_gru_ctrl", "lag_gru_torque", "lag_gru_force"} else None
+                gru_hidden_dim if variant in {"lag_gru", "lag_gru_uinit", "lag_gru_histinit_honly", "lag_gru_histrotres", "lag_gru_actbank_alphaonly", "lag_gru_alpha4", "lag_gru_ctrl", "lag_gru_torque", "lag_gru_force"} else None
             ),
             "use_hist_init": bool(getattr(model, "use_hist_init", False)),
             "history_len": history_len if uses_history(variant) else 0,
@@ -516,11 +540,14 @@ def build_checkpoint(
             "actbank_use_history": bool(getattr(model, "actbank_use_history", False)),
             "actbank_taus_ms": list(actbank_taus_ms) if getattr(model, "use_actbank_alpha", False) else None,
             "actbank_alpha_scale": actbank_alpha_scale if getattr(model, "use_actbank_alpha", False) else None,
+            "use_hist_rotres": bool(getattr(model, "use_hist_rotres", False)),
+            "hist_rotres_scale": hist_rotres_scale if getattr(model, "use_hist_rotres", False) else None,
             "loss_type": loss_type,
             "torque_scale_factor": torque_scale_factor,
             "control_ctx_dim": control_ctx_dim,
             "init_from": init_from,
             "freeze_non_torque": freeze_non_torque,
+            "freeze_base_except_new_head": freeze_base_except_new_head,
             "amp": amp_enabled,
             "seed": seed,
             "name_suffix": name_suffix,
@@ -582,22 +609,48 @@ def load_init_weights(model, raw_path):
         else init_payload
     )
 
-    load_result = model.load_state_dict(init_state, strict=False)
+    model_state = model.state_dict()
+    matched_state = {}
+    skipped_keys = []
+    for key, value in init_state.items():
+        if key not in model_state:
+            skipped_keys.append(key)
+            continue
+        if model_state[key].shape != value.shape:
+            skipped_keys.append(key)
+            continue
+        matched_state[key] = value
+
+    load_result = model.load_state_dict(matched_state, strict=False)
 
     resolved_path = str(init_from_path.resolve())
 
     print(f"🔁 Initialized model weights from: {resolved_path}")
-    #打印实际加载的是哪个文件，方便日志和排查。
+    print(f"   loaded_keys: {len(matched_state)}")
+    print(f"   skipped_keys: {len(skipped_keys)}")
     print(f"   missing_keys: {load_result.missing_keys}")
-    #当前模型里需要，但 checkpoint 里没有的参数
     print(f"   unexpected_keys: {load_result.unexpected_keys}")
-    #checkpoint 里有，但当前模型里不存在的参数
     return resolved_path
 
 #一个负责冻结参数，除了 torque_head 相关参数以外，其它参数全部冻结。局部微调。
 def freeze_non_torque_parameters(model):
     for name, param in model.named_parameters():
         param.requires_grad_(name.startswith("torque_head"))
+
+
+def freeze_base_except_hist_rotres(model):
+    for param in model.parameters():
+        param.requires_grad_(False)
+
+    trainable_modules = [
+        getattr(model, "hist_rot_encoder", None),
+        getattr(model, "hist_rotres_head", None),
+    ]
+    for module in trainable_modules:
+        if module is None:
+            continue
+        for param in module.parameters():
+            param.requires_grad_(True)
 
 #一个负责统计参数量，返回可训练参数量和总参数量
 def count_parameters(model):
@@ -673,7 +726,7 @@ def validate_resume_checkpoint(checkpoint, args, train_trajs, valid_trajs, aux_c
         expected_pairs.append(("lr_end", args.lr_end, config.get("lr_end")))
     if config.get("hidden_dim") is not None:
         expected_pairs.append(("hidden_dim", args.hidden_dim, config.get("hidden_dim")))
-    if args.variant in {"lag_gru", "lag_gru_uinit", "lag_gru_histinit_honly", "lag_gru_actbank_alphaonly", "lag_gru_alpha4", "lag_gru_ctrl", "lag_gru_torque", "lag_gru_force"} and config.get("gru_hidden_dim") is not None:
+    if args.variant in {"lag_gru", "lag_gru_uinit", "lag_gru_histinit_honly", "lag_gru_histrotres", "lag_gru_actbank_alphaonly", "lag_gru_alpha4", "lag_gru_ctrl", "lag_gru_torque", "lag_gru_force"} and config.get("gru_hidden_dim") is not None:
         expected_pairs.append(("gru_hidden_dim", args.gru_hidden_dim, config.get("gru_hidden_dim")))
     if args.variant == "lag_gru_histinit_honly":
         expected_pairs.append(("history_len", args.history_len, config.get("history_len", 0)))
@@ -714,6 +767,30 @@ def validate_resume_checkpoint(checkpoint, args, train_trajs, valid_trajs, aux_c
                 config.get("actbank_taus_ms", [20.0, 50.0, 100.0, 200.0]),
             )
         )
+    if args.variant == "lag_gru_histrotres":
+        expected_pairs.append(("history_len", args.history_len, config.get("history_len", 0)))
+        expected_pairs.append(
+            (
+                "use_hist_rotres",
+                True,
+                config.get("use_hist_rotres", False),
+            )
+        )
+        expected_pairs.append(
+            (
+                "hist_rotres_scale",
+                args.hist_rotres_scale,
+                config.get("hist_rotres_scale", 0.02),
+            )
+        )
+        if config.get("freeze_base_except_new_head") is not None:
+            expected_pairs.append(
+                (
+                    "freeze_base_except_new_head",
+                    args.freeze_base_except_new_head,
+                    config.get("freeze_base_except_new_head", False),
+                )
+            )
     if args.variant == "lag_gru_ctrl":
         expected_pairs.append(
             (
@@ -793,6 +870,7 @@ def main():
     parser.add_argument("--hist-init-scale", type=float, default=0.1)
     parser.add_argument("--actbank-alpha-scale", type=float, default=0.1)
     parser.add_argument("--actbank-taus-ms", type=str, default="20,50,100,200")
+    parser.add_argument("--hist-rotres-scale", type=float, default=0.02)
     parser.add_argument("--lr-start", "--lr_start", dest="lr_start", type=float, default=1e-5)
     parser.add_argument("--lr-end", "--lr_end", dest="lr_end", type=float, default=1e-8)
     parser.add_argument("--loss-type", type=str, default="exp", choices=["exp", "mixed", "mixed_early"])
@@ -833,6 +911,12 @@ def main():
         default=False,
         help="For lag_gru_torque only: freeze all parameters except torque_head.",
     )
+    parser.add_argument(
+        "--freeze-base-except-new-head",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="For lag_gru_histrotres only: train hist_rot_encoder and hist_rotres_head only.",
+    )
     parser.add_argument("--aux_cols", type=str, default='["az_body"]')
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument(
@@ -869,6 +953,10 @@ def main():
         raise ValueError("--init-from cannot be used together with --resume_path.")
     if args.freeze_non_torque and args.variant != "lag_gru_torque":
         raise ValueError("--freeze-non-torque is only supported for --variant lag_gru_torque.")
+    if args.freeze_base_except_new_head and args.variant != "lag_gru_histrotres":
+        raise ValueError(
+            "--freeze-base-except-new-head is only supported for --variant lag_gru_histrotres."
+        )
     if args.log_diagnostics_every < 0:
         raise ValueError("--log-diagnostics-every must be >= 0.")
     if args.history_len < 0:
@@ -877,6 +965,8 @@ def main():
         raise ValueError("--history-len must be > 0 for lag_gru_histinit_honly")
     if args.variant == "lag_gru_actbank_alphaonly" and args.history_len <= 0:
         raise ValueError("--history-len must be > 0 for lag_gru_actbank_alphaonly")
+    if args.variant == "lag_gru_histrotres" and args.history_len <= 0:
+        raise ValueError("--history-len must be > 0 for lag_gru_histrotres")
 
     train_trajs = parse_json_list(args.train_trajs, "train_trajs")
     aux_cols = parse_json_list(args.aux_cols, "aux_cols")
@@ -1120,6 +1210,7 @@ def main():
         hist_init_scale=args.hist_init_scale,
         actbank_taus_ms=actbank_taus_ms,
         actbank_alpha_scale=args.actbank_alpha_scale,
+        hist_rotres_scale=args.hist_rotres_scale,
         )#准备物理模型常数。
     model = model.to(device)
     resolved_init_from = None
@@ -1130,6 +1221,12 @@ def main():
     if args.freeze_non_torque:
         freeze_non_torque_parameters(model)
         print("🔒 freeze_non_torque enabled: training torque_head parameters only.")
+    if args.freeze_base_except_new_head:
+        freeze_base_except_hist_rotres(model)
+        print(
+            "🔒 freeze_base_except_new_head enabled: "
+            "training hist_rot_encoder and hist_rotres_head only."
+        )
     print(f"🧩 Initialized model variant: {args.variant}")
     num_trainable_params, num_total_params = count_parameters(model)
     print(f"Trainable parameters: {num_trainable_params:,} / {num_total_params:,}")
@@ -1183,6 +1280,7 @@ def main():
             "hist_init_scale": args.hist_init_scale,
             "actbank_taus_ms": list(actbank_taus_ms),
             "actbank_alpha_scale": args.actbank_alpha_scale,
+            "hist_rotres_scale": args.hist_rotres_scale,
             "resolved_init_from": resolved_init_from,
         },
         tags=["physres-ablation", args.variant, *train_trajs],
@@ -1411,8 +1509,10 @@ def main():
             hist_init_scale=args.hist_init_scale,
             actbank_taus_ms=actbank_taus_ms,
             actbank_alpha_scale=args.actbank_alpha_scale,
+            hist_rotres_scale=args.hist_rotres_scale,
             init_from=resolved_init_from,
             freeze_non_torque=args.freeze_non_torque,
+            freeze_base_except_new_head=args.freeze_base_except_new_head,
             amp_enabled=amp_enabled,
             scaler_dir=scaler_dir,
             train_trajs=train_trajs,

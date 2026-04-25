@@ -391,14 +391,42 @@ def show_metric_plots(evaluated_experiments, show=True, save_path=None):
         plt.close(fig)
 
 
+def build_prediction_plot_frame(df, state, horizon):
+    pred_col = f"{state}_pred_h{horizon}"
+    max_start = len(df) - horizon
+    if max_start <= 0:
+        return pd.DataFrame(columns=["target_time", "true", "pred"])
+
+    start_idx = np.arange(max_start)
+    target_idx = start_idx + horizon
+    plot_frame = pd.DataFrame(
+        {
+            "target_time": df["t"].iloc[target_idx].to_numpy(float),
+            "true": df[state].iloc[target_idx].to_numpy(float),
+            "pred": df[pred_col].iloc[start_idx].to_numpy(float),
+        }
+    )
+    plot_frame = plot_frame.replace([np.inf, -np.inf], np.nan)
+    return plot_frame.dropna(subset=["target_time", "true", "pred"])
+
+
+def select_prediction_time_window(target_time, preferred_start=20.0, preferred_end=25.0):
+    target_time = np.asarray(target_time, dtype=float)
+    target_time = target_time[np.isfinite(target_time)]
+    if target_time.size == 0:
+        return preferred_start, preferred_end
+
+    preferred_mask = (target_time >= preferred_start) & (target_time <= preferred_end)
+    if preferred_mask.any():
+        return preferred_start, preferred_end
+
+    center_time = 0.5 * (target_time.min() + target_time.max())
+    half_width = 2.5
+    return center_time - half_width, center_time + half_width
+
+
 def show_prediction_plots(evaluated_experiments, horizon, show=True, save_path=None):
     reference_df = evaluated_experiments[0]["df_pred"]
-    max_available = max(len(reference_df) - horizon, 1)
-    n_start = min(2000, max_available - 1)
-    n_end = min(n_start + 500, max_available)
-    if n_end <= n_start:
-        n_start = 0
-        n_end = max_available
 
     state_names = [
         "x",
@@ -422,43 +450,59 @@ def show_prediction_plots(evaluated_experiments, horizon, show=True, save_path=N
     ]
 
     fig, axs = plt.subplots(4, 3, figsize=(12, 5), sharex=True, dpi=200)
-    t = reference_df["t"].values
     colors = plt.get_cmap("tab10").colors
+    reference_plot_frame = build_prediction_plot_frame(reference_df, "x", horizon)
+    window_start, window_end = select_prediction_time_window(
+        reference_plot_frame["target_time"].to_numpy(float)
+    )
 
     for r in range(4):
         for c in range(3):
             idx = r * 3 + c
             state = state_names[idx]
-            pred_col = f"{state}_pred_h{horizon}"
             ax = axs[r, c]
 
-            true = (
-                reference_df[state][n_start + horizon : n_end + horizon]
-                .rolling(20, min_periods=1, center=True)
-                .mean()
-            )
+            reference_state_frame = build_prediction_plot_frame(reference_df, state, horizon)
+            reference_state_frame = reference_state_frame[
+                (reference_state_frame["target_time"] >= window_start)
+                & (reference_state_frame["target_time"] <= window_end)
+            ]
 
             for exp_idx, experiment in enumerate(evaluated_experiments):
-                pred = (
-                    experiment["df_pred"][pred_col][n_start:n_end]
-                    .rolling(20, min_periods=1, center=True)
-                    .mean()
+                plot_frame = build_prediction_plot_frame(
+                    experiment["df_pred"],
+                    state,
+                    horizon,
                 )
+                plot_frame = plot_frame[
+                    (plot_frame["target_time"] >= window_start)
+                    & (plot_frame["target_time"] <= window_end)
+                ]
+                if plot_frame.empty:
+                    continue
+
+                pred = plot_frame["pred"].rolling(20, min_periods=1, center=True).mean()
                 ax.plot(
-                    t[n_start + horizon : n_end + horizon],
+                    plot_frame["target_time"],
                     pred,
                     linewidth=1.2,
                     color=colors[exp_idx % len(colors)],
                     label=experiment["model_label"],
                 )
 
-            ax.plot(
-                t[n_start + horizon : n_end + horizon],
-                true,
-                "k--",
-                linewidth=1.5,
-                label="GT",
-            )
+            if not reference_state_frame.empty:
+                true = (
+                    reference_state_frame["true"]
+                    .rolling(20, min_periods=1, center=True)
+                    .mean()
+                )
+                ax.plot(
+                    reference_state_frame["target_time"],
+                    true,
+                    "k--",
+                    linewidth=1.5,
+                    label="GT",
+                )
             ax.set_ylabel(state_labels[r][c], fontsize=12)
             ax.grid(True, alpha=0.3)
 

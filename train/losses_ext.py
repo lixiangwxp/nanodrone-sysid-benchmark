@@ -361,9 +361,10 @@ def compute_loss(model, criterion, batch, device, loss_config):
         else None
     )
     needs_history = bool(
-        getattr(model, "use_hist_init", False)
+        getattr(model, "requires_history", False)
+        or getattr(model, "use_hist_init", False)
         or getattr(model, "actbank_use_history", False)
-        or getattr(model, "requires_history", False)
+        or getattr(model, "use_hist_rotres", False)
     )
     if needs_history and x_hist is None:
         raise ValueError("Model requires history but batch does not provide x_hist/u_hist")

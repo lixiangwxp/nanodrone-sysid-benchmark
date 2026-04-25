@@ -36,7 +36,7 @@ def parse_json_list(raw_value, arg_name):
 
 
 def uses_lag(variant):
-    return variant in {"lag", "lag_gru", "lag_gru_uinit", "lag_gru_histinit_honly", "lag_gru_actbank_alphaonly", "lag_gru_alpha4", "lag_gru_ctrl", "lag_gru_torque", "lag_gru_force", "lag_geo", "full"}
+    return variant in {"lag", "lag_gru", "lag_gru_uinit", "lag_gru_histinit_honly", "lag_gru_histrotres", "lag_gru_actbank_alphaonly", "lag_gru_alpha4", "lag_gru_ctrl", "lag_gru_torque", "lag_gru_force", "lag_geo", "full"}
 
 
 def uses_hist_init(variant):
@@ -44,7 +44,7 @@ def uses_hist_init(variant):
 
 
 def uses_history(variant):
-    return variant in {"lag_gru_histinit_honly", "lag_gru_actbank_alphaonly"}
+    return variant in {"lag_gru_histinit_honly", "lag_gru_actbank_alphaonly", "lag_gru_histrotres"}
 
 
 def find_latest_model(model_root):
@@ -99,7 +99,7 @@ def rebuild_model(checkpoint, x_scaler, u_scaler, device):
     gru_hidden_dim = config.get("gru_hidden_dim", 64)
     num_layers = config.get("num_layers", 5)
     default_residual_input_dim = 4
-    if variant in {"lag_gru", "lag_gru_uinit", "lag_gru_histinit_honly", "lag_gru_actbank_alphaonly", "lag_gru_alpha4", "lag_gru_ctrl", "lag_gru_torque", "lag_gru_force"}:
+    if variant in {"lag_gru", "lag_gru_uinit", "lag_gru_histinit_honly", "lag_gru_histrotres", "lag_gru_actbank_alphaonly", "lag_gru_alpha4", "lag_gru_ctrl", "lag_gru_torque", "lag_gru_force"}:
         default_residual_input_dim = gru_hidden_dim + 12
     elif uses_lag(variant):
         default_residual_input_dim = 12
@@ -172,6 +172,25 @@ def rebuild_model(checkpoint, x_scaler, u_scaler, device):
                 config.get("actbank_taus_ms", [20.0, 50.0, 100.0, 200.0])
             ),
             actbank_alpha_scale=float(config.get("actbank_alpha_scale", 0.1)),
+        ).to(device)
+    elif variant == "lag_gru_histrotres":
+        model = LagPhysResGRUModel(
+            phys=phys_model,
+            residual=residual_model,
+            x_scaler=x_scaler,
+            u_scaler=u_scaler,
+            lag_mode=config.get("lag_mode", "per_motor"),
+            alpha_init=config.get("alpha_init", 0.85),
+            hidden_dim=gru_hidden_dim,
+            alpha_dim=1,
+            use_u_init=False,
+            u_init_scale=0.05,
+            use_hist_init=False,
+            hist_init_scale=0.1,
+            use_actbank_alpha=False,
+            actbank_use_history=False,
+            use_hist_rotres=True,
+            hist_rotres_scale=float(config.get("hist_rotres_scale", 0.02)),
         ).to(device)
     elif variant == "lag_gru_alpha4":
         model = LagPhysResGRUModel(
