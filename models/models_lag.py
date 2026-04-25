@@ -518,11 +518,14 @@ class LagPhysResGRUModel(LagPhysResQuadModel):
         return u0_norm.unsqueeze(-1).expand(
             -1, -1, self.actbank_lambdas.shape[-1]
         ).contiguous()
-
-
-
-
-    def forward(self, x0, u_seq, x_hist=None, u_hist=None):
+    def forward(
+        self,
+        x0,
+        u_seq,
+        x_hist=None,
+        u_hist=None,
+        return_debug=False,
+    ):
         # 兼容单步控制输入 (B,4)；统一成时序输入 (B,T,4) 做 rollout。
         if u_seq.ndim == 2:
             u_seq = u_seq.unsqueeze(1)
@@ -534,6 +537,32 @@ class LagPhysResGRUModel(LagPhysResQuadModel):
 
         _, horizon, _ = u_seq.shape
         preds = []
+        if return_debug:
+            debug = {
+                "alpha": [],
+                "alpha_logits": [],
+                "u_raw_norm": [],
+                "u_eff_norm": [],
+                "u_diff_norm": [],
+                "u_raw_real": [],
+                "u_eff_real": [],
+                "u_phys_raw": [],
+                "u_phys_eff": [],
+                "u_phys_diff": [],
+                "h_norm": [],
+                "dx_res_before": [],
+                "dx_res_after": [],
+                "dx_res_delta": [],
+                "x_phys_next_norm": [],
+            }
+            if self.use_actbank_alpha:
+                debug["delta_alpha_logits"] = []
+                debug["bank_state"] = []
+            if self.use_hist_rotres:
+                debug["delta_rotomega"] = []
+                debug["hist_rot_context_norm"] = []
+        else:
+            debug = None
         # 从当前状态生成初始记忆h；执行器内部状态用第一步控制作seed。
         h = self.h_init(x_norm)
 
@@ -621,6 +650,8 @@ class LagPhysResGRUModel(LagPhysResQuadModel):
             alpha_logits = self.alpha_head(alpha_in)
 
             if self.use_actbank_alpha:
+                if return_debug:
+                    debug["bank_state"].append(bank_state.detach().unsqueeze(1))
                 bank_flat = bank_state.reshape(bank_state.shape[0], -1)
                 bank_feat = torch.cat(
                     [
@@ -644,6 +675,22 @@ class LagPhysResGRUModel(LagPhysResQuadModel):
             u_eff_real = alpha_t * u_eff_prev_real + (1.0 - alpha_t) * u_raw_real
             u_eff_norm = self.u_normed(u_eff_real)
 
+            if return_debug:
+                u_phys_raw = self.motor_to_phys_diff(u_raw_real)
+                u_phys_eff = self.motor_to_phys_diff(u_eff_real)
+                debug["alpha"].append(alpha_t.detach().unsqueeze(1))
+                debug["alpha_logits"].append(alpha_logits.detach().unsqueeze(1))
+                debug["u_raw_norm"].append(u_raw_norm.detach().unsqueeze(1))
+                debug["u_eff_norm"].append(u_eff_norm.detach().unsqueeze(1))
+                debug["u_diff_norm"].append((u_eff_norm - u_raw_norm).detach().unsqueeze(1))
+                debug["u_raw_real"].append(u_raw_real.detach().unsqueeze(1))
+                debug["u_eff_real"].append(u_eff_real.detach().unsqueeze(1))
+                debug["u_phys_raw"].append(u_phys_raw.detach().unsqueeze(1))
+                debug["u_phys_eff"].append(u_phys_eff.detach().unsqueeze(1))
+                debug["u_phys_diff"].append((u_phys_eff - u_phys_raw).detach().unsqueeze(1))
+                if self.use_actbank_alpha:
+                    debug["delta_alpha_logits"].append(delta_alpha_logits.detach().unsqueeze(1))
+
             # 物理主干在真实量纲下推进一步，再映回归一化空间。
             x_real = self.x_denorm(x_norm)
             x_phys_next_real = self.physics_step_from_motors(x_real, u_eff_real)
@@ -652,10 +699,14 @@ class LagPhysResGRUModel(LagPhysResQuadModel):
             # 记忆状态 h 随当前状态、控制和有效执行器输入一起更新。
             gru_in = self._pack_gru_features(x_norm, u_raw_norm, u_eff_norm, h)
             h = self.gru_cell(gru_in, h)
+            if return_debug:
+                debug["h_norm"].append(h.detach().norm(dim=-1, keepdim=True).unsqueeze(1))
+                debug["x_phys_next_norm"].append(x_phys_next_norm.detach().unsqueeze(1))
 
             # 残差网络学习 physics 未覆盖的修正量，再和物理预测相加。
             residual_in = self._pack_gru_features(x_norm, u_raw_norm, u_eff_norm, h)
             dx_res = self.residual.out(self.residual.mlp(residual_in))
+            dx_res_before = dx_res
 
             if self.use_hist_rotres:
                 rotres_feat = torch.cat(
@@ -674,6 +725,19 @@ class LagPhysResGRUModel(LagPhysResQuadModel):
                 )
                 dx_res = dx_res.clone()
                 dx_res[:, 6:12] = dx_res[:, 6:12] + delta_rotomega
+                if return_debug:
+                    debug["delta_rotomega"].append(delta_rotomega.detach().unsqueeze(1))
+                    debug["hist_rot_context_norm"].append(
+                        c_hist_rot.detach().norm(dim=-1, keepdim=True).unsqueeze(1)
+                    )
+
+            dx_res_after = dx_res
+            if return_debug:
+                debug["dx_res_before"].append(dx_res_before.detach().unsqueeze(1))
+                debug["dx_res_after"].append(dx_res_after.detach().unsqueeze(1))
+                debug["dx_res_delta"].append(
+                    (dx_res_after - dx_res_before).detach().unsqueeze(1)
+                )
 
             x_next_norm = x_phys_next_norm + dx_res
 
@@ -689,7 +753,15 @@ class LagPhysResGRUModel(LagPhysResQuadModel):
                 bank_state = self._actbank_update(bank_state, u_raw_norm)
 
         # 拼成完整预测序列 (B,T,12)。
-        return torch.cat(preds, dim=1)
+        pred_seq = torch.cat(preds, dim=1)
+        if not return_debug:
+            return pred_seq
+
+        debug_stacked = {}
+        for key, values in debug.items():
+            if len(values) > 0:
+                debug_stacked[key] = torch.cat(values, dim=1)
+        return pred_seq, debug_stacked
 
 
 class LagPhysResGRUControlModel(LagPhysResGRUModel):

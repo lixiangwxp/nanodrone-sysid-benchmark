@@ -47,6 +47,86 @@ def uses_history(variant):
     return variant in {"lag_gru_histinit_honly", "lag_gru_actbank_alphaonly", "lag_gru_histrotres"}
 
 
+DEBUG_TRACE_VARIANTS = {
+    "lag_gru",
+    "lag_gru_uinit",
+    "lag_gru_histinit_honly",
+    "lag_gru_histrotres",
+    "lag_gru_actbank_alphaonly",
+    "lag_gru_alpha4",
+}
+
+
+def inverse_scaled_array(scaler, tensor):
+    array = tensor.detach().cpu().numpy()
+    if scaler is None:
+        return array
+    return scaler.inverse_transform(array.reshape(-1, array.shape[-1])).reshape(array.shape)
+
+
+def tensor_to_numpy(tensor):
+    return tensor.detach().cpu().numpy()
+
+
+def save_debug_trace_batch(
+    trace_path,
+    *,
+    pred_seq,
+    true_seq,
+    x0,
+    u_seq,
+    debug,
+    x_scaler,
+    u_scaler,
+    dt,
+    batch_index,
+    sample_offset,
+    start_indices=None,
+    x_hist=None,
+    u_hist=None,
+    max_samples=64,
+):
+    sample_count = min(int(max_samples), int(pred_seq.shape[0]))
+    if sample_count <= 0:
+        return None
+
+    sl = slice(0, sample_count)
+    trace = {
+        "batch_index": np.asarray(batch_index, dtype=np.int64),
+        "sample_index": np.arange(sample_offset, sample_offset + sample_count, dtype=np.int64),
+        "pred_seq": inverse_scaled_array(x_scaler, pred_seq[sl]),
+        "true_seq": inverse_scaled_array(x_scaler, true_seq[sl]),
+        "pred_seq_norm": tensor_to_numpy(pred_seq[sl]),
+        "true_seq_norm": tensor_to_numpy(true_seq[sl]),
+        "x0": inverse_scaled_array(x_scaler, x0[sl]),
+        "u_seq": inverse_scaled_array(u_scaler, u_seq[sl]),
+        "x0_norm": tensor_to_numpy(x0[sl]),
+        "u_seq_norm": tensor_to_numpy(u_seq[sl]),
+    }
+
+    if start_indices is not None:
+        start_index_np = tensor_to_numpy(start_indices[sl]).astype(np.int64)
+        trace["start_index"] = start_index_np
+        trace["t_start"] = start_index_np.astype(np.float64) * float(dt)
+        trace["t"] = trace["t_start"][:, None] + (
+            np.arange(1, pred_seq.shape[1] + 1, dtype=np.float64)[None, :] * float(dt)
+        )
+
+    if x_hist is not None:
+        trace["x_hist"] = inverse_scaled_array(x_scaler, x_hist[sl])
+        trace["x_hist_norm"] = tensor_to_numpy(x_hist[sl])
+    if u_hist is not None:
+        trace["u_hist"] = inverse_scaled_array(u_scaler, u_hist[sl])
+        trace["u_hist_norm"] = tensor_to_numpy(u_hist[sl])
+
+    for key, value in debug.items():
+        trace[key] = tensor_to_numpy(value[sl])
+
+    trace_path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(trace_path, **trace)
+    return trace_path
+
+
 def find_latest_model(model_root):
     model_files = sorted(
         [
@@ -268,9 +348,17 @@ def main():
     parser.add_argument("--test_trajs", type=str, default='["melon"]')
     parser.add_argument("--out_root", type=str, default=str(PROJECT_ROOT / "out" / "predictions"))
     parser.add_argument("--data_root", type=str, default=str(PROJECT_ROOT / "data" / "test"))
+    parser.add_argument("--debug-trace", action="store_true")
+    parser.add_argument("--debug-trace-dir", type=str, default=None)
+    parser.add_argument("--debug-trace-max-batches", type=int, default=1)
+    parser.add_argument("--debug-trace-max-samples", type=int, default=64)
     args = parser.parse_args()
     if args.history_len < 0:
         raise ValueError("--history-len must be >= 0")
+    if args.debug_trace_max_batches < 0:
+        raise ValueError("--debug-trace-max-batches must be >= 0")
+    if args.debug_trace_max_samples <= 0:
+        raise ValueError("--debug-trace-max-samples must be > 0")
 
     test_trajs = parse_json_list(args.test_trajs, "test_trajs")
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
@@ -287,6 +375,11 @@ def main():
 
     checkpoint = torch.load(model_path, map_location=device)
     variant = checkpoint["config"]["variant"]
+    if args.debug_trace and variant not in DEBUG_TRACE_VARIANTS:
+        raise NotImplementedError(
+            "--debug-trace is only supported for standard LagPhysResGRUModel "
+            f"variants: {sorted(DEBUG_TRACE_VARIANTS)}"
+        )
     history_len = checkpoint["config"].get("history_len", args.history_len)
     if uses_history(variant) and history_len <= 0:
         raise ValueError(
@@ -321,8 +414,20 @@ def main():
 
     preds, trues = [], []
     needs_history = uses_history(variant)
+    debug_trace_dir = None
+    debug_saved_paths = []
+    if args.debug_trace:
+        if args.debug_trace_dir is None:
+            debug_trace_dir = PROJECT_ROOT / "out" / "debug_traces" / model_name
+        else:
+            debug_trace_dir = Path(args.debug_trace_dir).expanduser()
+        debug_trace_dir.mkdir(parents=True, exist_ok=True)
+
+    sample_cursor = 0
+    debug_batch_count = 0
+    traj_label = "_".join(test_trajs)
     with torch.no_grad():
-        for batch in test_loader:
+        for batch_index, batch in enumerate(test_loader):
             if len(batch) >= 5:
                 x0, u_seq, x_seq_true, x_hist, u_hist = batch[:5]
             else:
@@ -331,17 +436,73 @@ def main():
                 u_hist = None
             if needs_history and x_hist is None:
                 raise ValueError("Model requires history but batch does not provide x_hist/u_hist")
+            x0_cpu = x0
+            u_seq_cpu = u_seq
+            x_seq_true_cpu = x_seq_true
+            x_hist_cpu = x_hist
+            u_hist_cpu = u_hist
+            batch_size_actual = x0.shape[0]
+            start_indices = None
+            if getattr(test_dataset, "start_indices", None) is not None:
+                start_indices = test_dataset.start_indices[
+                    sample_cursor : sample_cursor + batch_size_actual
+                ]
+
             x0 = x0.to(device)
             u_seq = u_seq.to(device)
+            capture_debug = (
+                args.debug_trace
+                and debug_batch_count < args.debug_trace_max_batches
+            )
 
             if needs_history:
                 x_hist = x_hist.to(device)
                 u_hist = u_hist.to(device)
-                x_pred = model(x0, u_seq, x_hist=x_hist, u_hist=u_hist).cpu()
+                if capture_debug:
+                    x_pred, debug = model(
+                        x0,
+                        u_seq,
+                        x_hist=x_hist,
+                        u_hist=u_hist,
+                        return_debug=True,
+                    )
+                else:
+                    x_pred = model(x0, u_seq, x_hist=x_hist, u_hist=u_hist)
+                    debug = None
             else:
-                x_pred = model(x0, u_seq).cpu()
+                if capture_debug:
+                    x_pred, debug = model(x0, u_seq, return_debug=True)
+                else:
+                    x_pred = model(x0, u_seq)
+                    debug = None
+            x_pred = x_pred.cpu()
+
+            if capture_debug:
+                trace_path = debug_trace_dir / f"{traj_label}_batch{debug_batch_count:03d}.npz"
+                saved_path = save_debug_trace_batch(
+                    trace_path,
+                    pred_seq=x_pred,
+                    true_seq=x_seq_true_cpu,
+                    x0=x0_cpu,
+                    u_seq=u_seq_cpu,
+                    debug=debug,
+                    x_scaler=test_dataset.x_scaler,
+                    u_scaler=test_dataset.u_scaler,
+                    dt=dt,
+                    batch_index=batch_index,
+                    sample_offset=sample_cursor,
+                    start_indices=start_indices,
+                    x_hist=x_hist_cpu if needs_history else None,
+                    u_hist=u_hist_cpu if needs_history else None,
+                    max_samples=args.debug_trace_max_samples,
+                )
+                if saved_path is not None:
+                    debug_saved_paths.append(saved_path)
+                    debug_batch_count += 1
+
             preds.append(x_pred)
             trues.append(x_seq_true)
+            sample_cursor += batch_size_actual
 
     preds = torch.cat(preds, dim=0).numpy()
     trues = torch.cat(trues, dim=0).numpy()
@@ -373,6 +534,8 @@ def main():
     print(f"✅ Loaded model: {model_path}")
     print(f"🧩 Variant: {variant}")
     print(f"💾 Saved predictions to: {out_path}")
+    for debug_path in debug_saved_paths:
+        print(f"🧪 Saved debug trace to: {debug_path}")
 
     plt.figure(figsize=(8, 4))
     plt.plot(df_pred["t"], df_pred["x"], label="x true")
