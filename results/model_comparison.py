@@ -169,6 +169,12 @@ def parse_args(argv=None):
         help="Render metric and trajectory comparison plots for the supplied experiments.",
     )
     parser.add_argument(
+        "--plot-dir",
+        type=str,
+        default=None,
+        help="Optional directory for saving metric and trajectory comparison plots.",
+    )
+    parser.add_argument(
         "--summary-path",
         type=str,
         default=str(PROJECT_ROOT / "out" / "benchmark_summary.csv"),
@@ -336,7 +342,7 @@ def print_latex_summary(evaluated_experiments, max_horizon):
     print_latex_table_results(latex_rows, target_horizons)
 
 
-def show_metric_plots(evaluated_experiments):
+def show_metric_plots(evaluated_experiments, show=True, save_path=None):
     fig, axs = plt.subplots(1, 4, figsize=(12, 2.5), sharex=True)
     metric_names = ["pos", "vel", "rot", "omega"]
     ylabels = [
@@ -374,10 +380,18 @@ def show_metric_plots(evaluated_experiments):
         fontsize=11,
     )
     plt.subplots_adjust(top=0.82, bottom=0.18, wspace=0.35)
-    plt.show()
+
+    if save_path is not None:
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(save_path, bbox_inches="tight")
+
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
 
 
-def show_prediction_plots(evaluated_experiments, horizon):
+def show_prediction_plots(evaluated_experiments, horizon, show=True, save_path=None):
     reference_df = evaluated_experiments[0]["df_pred"]
     max_available = max(len(reference_df) - horizon, 1)
     n_start = min(2000, max_available - 1)
@@ -468,13 +482,46 @@ def show_prediction_plots(evaluated_experiments, horizon):
         fontsize=11,
     )
     plt.subplots_adjust(top=0.84, bottom=0.12, hspace=0.28, wspace=0.35)
-    plt.show()
+
+    if save_path is not None:
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(save_path, bbox_inches="tight")
+
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
 
 
-def maybe_show_plots(evaluated_experiments, max_horizon):
+def maybe_render_plots(evaluated_experiments, max_horizon, show_plots=False, plot_dir=None):
     setup_matplotlib()
-    show_metric_plots(evaluated_experiments)
-    show_prediction_plots(evaluated_experiments, horizon=min(50, max_horizon))
+    saved_paths = []
+    plot_dir = Path(plot_dir).expanduser().resolve() if plot_dir is not None else None
+    horizon = min(50, max_horizon)
+
+    metric_plot_path = plot_dir / "metrics_comparison.png" if plot_dir is not None else None
+    prediction_plot_path = (
+        plot_dir / f"trajectory_h{horizon}_comparison.png" if plot_dir is not None else None
+    )
+
+    show_metric_plots(
+        evaluated_experiments,
+        show=show_plots,
+        save_path=metric_plot_path,
+    )
+    if metric_plot_path is not None:
+        saved_paths.append(metric_plot_path)
+
+    show_prediction_plots(
+        evaluated_experiments,
+        horizon=horizon,
+        show=show_plots,
+        save_path=prediction_plot_path,
+    )
+    if prediction_plot_path is not None:
+        saved_paths.append(prediction_plot_path)
+
+    return saved_paths
 
 
 def main(argv=None):
@@ -494,8 +541,15 @@ def main(argv=None):
 
     print_latex_summary(evaluated_experiments, args.max_horizon)
 
-    if args.show_plots:
-        maybe_show_plots(evaluated_experiments, args.max_horizon)
+    if args.show_plots or args.plot_dir is not None:
+        saved_plot_paths = maybe_render_plots(
+            evaluated_experiments,
+            args.max_horizon,
+            show_plots=args.show_plots,
+            plot_dir=args.plot_dir,
+        )
+        for plot_path in saved_plot_paths:
+            print(f"🖼️ Saved plot to: {plot_path}")
 
     return combined_df
 

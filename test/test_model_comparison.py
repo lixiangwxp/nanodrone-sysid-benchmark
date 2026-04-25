@@ -169,6 +169,32 @@ class ModelComparisonCLITests(unittest.TestCase):
         summary_df = pd.read_csv(summary_path)
         self.assertEqual(summary_df["model_label"].tolist(), ["first_run", "second_run"])
 
+    def test_plot_dir_saves_comparison_plots(self):
+        prediction_csv = self.write_prediction_csv("plot.csv")
+        summary_path = self.tmp_path / "summary.csv"
+        plot_dir = self.tmp_path / "plots"
+
+        model_comparison.main(
+            [
+                "--prediction-csv",
+                str(prediction_csv),
+                "--model-label",
+                "plot_model",
+                "--summary-path",
+                str(summary_path),
+                "--plot-dir",
+                str(plot_dir),
+            ]
+        )
+
+        expected_plots = [
+            plot_dir / "metrics_comparison.png",
+            plot_dir / "trajectory_h50_comparison.png",
+        ]
+        for plot_path in expected_plots:
+            self.assertTrue(plot_path.is_file())
+            self.assertGreater(plot_path.stat().st_size, 0)
+
     def test_existing_summary_without_created_at_is_preserved(self):
         summary_path = self.tmp_path / "legacy_summary.csv"
         legacy_row = {
