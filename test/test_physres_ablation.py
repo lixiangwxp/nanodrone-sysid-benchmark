@@ -36,11 +36,15 @@ def parse_json_list(raw_value, arg_name):
 
 
 def uses_lag(variant):
-    return variant in {"lag", "lag_gru", "lag_gru_uinit", "lag_gru_histinit_honly", "lag_gru_alpha4", "lag_gru_ctrl", "lag_gru_torque", "lag_gru_force", "lag_geo", "full"}
+    return variant in {"lag", "lag_gru", "lag_gru_uinit", "lag_gru_histinit_honly", "lag_gru_actbank_alphaonly", "lag_gru_alpha4", "lag_gru_ctrl", "lag_gru_torque", "lag_gru_force", "lag_geo", "full"}
 
 
 def uses_hist_init(variant):
     return variant == "lag_gru_histinit_honly"
+
+
+def uses_history(variant):
+    return variant in {"lag_gru_histinit_honly", "lag_gru_actbank_alphaonly"}
 
 
 def find_latest_model(model_root):
@@ -95,7 +99,7 @@ def rebuild_model(checkpoint, x_scaler, u_scaler, device):
     gru_hidden_dim = config.get("gru_hidden_dim", 64)
     num_layers = config.get("num_layers", 5)
     default_residual_input_dim = 4
-    if variant in {"lag_gru", "lag_gru_uinit", "lag_gru_histinit_honly", "lag_gru_alpha4", "lag_gru_ctrl", "lag_gru_torque", "lag_gru_force"}:
+    if variant in {"lag_gru", "lag_gru_uinit", "lag_gru_histinit_honly", "lag_gru_actbank_alphaonly", "lag_gru_alpha4", "lag_gru_ctrl", "lag_gru_torque", "lag_gru_force"}:
         default_residual_input_dim = gru_hidden_dim + 12
     elif uses_lag(variant):
         default_residual_input_dim = 12
@@ -147,6 +151,27 @@ def rebuild_model(checkpoint, x_scaler, u_scaler, device):
             u_init_scale=0.05,
             use_hist_init=True,
             hist_init_scale=config.get("hist_init_scale", 0.1),
+        ).to(device)
+    elif variant == "lag_gru_actbank_alphaonly":
+        model = LagPhysResGRUModel(
+            phys=phys_model,
+            residual=residual_model,
+            x_scaler=x_scaler,
+            u_scaler=u_scaler,
+            lag_mode=config.get("lag_mode", "per_motor"),
+            alpha_init=config.get("alpha_init", 0.85),
+            hidden_dim=gru_hidden_dim,
+            alpha_dim=1,
+            use_u_init=False,
+            u_init_scale=0.05,
+            use_hist_init=False,
+            hist_init_scale=0.1,
+            use_actbank_alpha=True,
+            actbank_use_history=True,
+            actbank_taus_ms=tuple(
+                config.get("actbank_taus_ms", [20.0, 50.0, 100.0, 200.0])
+            ),
+            actbank_alpha_scale=float(config.get("actbank_alpha_scale", 0.1)),
         ).to(device)
     elif variant == "lag_gru_alpha4":
         model = LagPhysResGRUModel(
@@ -244,9 +269,9 @@ def main():
     checkpoint = torch.load(model_path, map_location=device)
     variant = checkpoint["config"]["variant"]
     history_len = checkpoint["config"].get("history_len", args.history_len)
-    if uses_hist_init(variant) and history_len <= 0:
+    if uses_history(variant) and history_len <= 0:
         raise ValueError(
-            "lag_gru_histinit_honly requires history_len from checkpoint config "
+            f"{variant} requires history_len from checkpoint config "
             "or --history-len > 0"
         )
 
@@ -261,7 +286,7 @@ def main():
         test_trajs,
         data_root,
         args.horizon,
-        history_len=history_len if uses_hist_init(variant) else 0,
+        history_len=history_len if uses_history(variant) else 0,
     )
     test_dataset = combine_concat_dataset(
         ConcatDataset(test_ds), scale=True, fold="test", scaler_dir=scaler_dir
@@ -276,6 +301,7 @@ def main():
     )
 
     preds, trues = [], []
+    needs_history = uses_history(variant)
     with torch.no_grad():
         for batch in test_loader:
             if len(batch) >= 5:
@@ -284,10 +310,12 @@ def main():
                 x0, u_seq, x_seq_true = batch[:3]
                 x_hist = None
                 u_hist = None
+            if needs_history and x_hist is None:
+                raise ValueError("Model requires history but batch does not provide x_hist/u_hist")
             x0 = x0.to(device)
             u_seq = u_seq.to(device)
 
-            if x_hist is not None:
+            if needs_history:
                 x_hist = x_hist.to(device)
                 u_hist = u_hist.to(device)
                 x_pred = model(x0, u_seq, x_hist=x_hist, u_hist=u_hist).cpu()
@@ -306,7 +334,7 @@ def main():
     state_names = ["x", "y", "z", "vx", "vy", "vz", "rx", "ry", "rz", "wx", "wy", "wz"]
 
     num_windows = preds.shape[0]
-    start_index = history_len if variant == "lag_gru_histinit_honly" else 0
+    start_index = history_len if uses_history(variant) else 0
     data = {"t": (np.arange(num_windows) + start_index) * dt}
     for idx, name in enumerate(state_names):
         data[name] = trues[:, 0, idx]

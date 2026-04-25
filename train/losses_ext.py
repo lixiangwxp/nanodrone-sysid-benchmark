@@ -360,6 +360,13 @@ def compute_loss(model, criterion, batch, device, loss_config):
         if len(batch) == 4
         else None
     )
+    needs_history = bool(
+        getattr(model, "use_hist_init", False)
+        or getattr(model, "actbank_use_history", False)
+        or getattr(model, "requires_history", False)
+    )
+    if needs_history and x_hist is None:
+        raise ValueError("Model requires history but batch does not provide x_hist/u_hist")
 
     aux_pred = None
     force_pred_seq = None
@@ -370,7 +377,7 @@ def compute_loss(model, criterion, batch, device, loss_config):
     elif loss_config.use_aux:
         pred_seq, aux_pred = model(x0, u_seq, return_aux=True)
     else:
-        if x_hist is not None:
+        if needs_history:
             pred_seq = model(x0, u_seq, x_hist=x_hist, u_hist=u_hist)
         else:
             pred_seq = model(x0, u_seq)

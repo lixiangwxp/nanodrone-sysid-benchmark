@@ -329,6 +329,10 @@ class LagPhysResGRUModel(LagPhysResQuadModel):
         u_init_scale=0.05,
         use_hist_init=False,
         hist_init_scale=0.1,
+        use_actbank_alpha=False,
+        actbank_use_history=False,
+        actbank_taus_ms=(20.0, 50.0, 100.0, 200.0),
+        actbank_alpha_scale=0.1,
     ):
         nn.Module.__init__(self)
 
@@ -352,8 +356,19 @@ class LagPhysResGRUModel(LagPhysResQuadModel):
         self.u_init_scale = float(u_init_scale)
         self.use_hist_init = bool(use_hist_init)
         self.hist_init_scale = float(hist_init_scale)
+        self.use_actbank_alpha = bool(use_actbank_alpha)
+        self.actbank_use_history = bool(actbank_use_history)
+        self.actbank_alpha_scale = float(actbank_alpha_scale)
+        self.actbank_taus_ms = tuple(float(tau_ms) for tau_ms in actbank_taus_ms)
+        self.requires_history = bool(self.use_hist_init or self.actbank_use_history)
         if self.alpha_dim not in (1, 4):
             raise ValueError("alpha_dim must be 1 or 4")
+        if self.use_actbank_alpha and self.alpha_dim != 1:
+            raise ValueError("use_actbank_alpha requires alpha_dim == 1")
+        if self.use_actbank_alpha and not self.actbank_taus_ms:
+            raise ValueError("actbank_taus_ms must be non-empty when use_actbank_alpha=True")
+        if self.use_actbank_alpha and any(tau_ms <= 0.0 for tau_ms in self.actbank_taus_ms):
+            raise ValueError("actbank_taus_ms must be positive")
 
         # 4) 维度与结构检查
         state_dim = residual.out.out_features
@@ -405,6 +420,22 @@ class LagPhysResGRUModel(LagPhysResQuadModel):
             self.hist_encoder = None
             self.hist_h_head = None
 
+        if self.use_actbank_alpha:
+            tau_sec = torch.tensor(self.actbank_taus_ms, dtype=torch.float32) / 1000.0
+            lambdas = torch.exp(-torch.tensor(float(self.dt), dtype=torch.float32) / tau_sec)
+            self.register_buffer("actbank_lambdas", lambdas.view(1, 1, -1))
+            actbank_feat_dim = control_dim * len(self.actbank_taus_ms) + 3 * control_dim
+            self.actbank_alpha_head = nn.Sequential(
+                nn.Linear(actbank_feat_dim, hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, 1),
+            )
+            nn.init.zeros_(self.actbank_alpha_head[-1].weight)
+            nn.init.zeros_(self.actbank_alpha_head[-1].bias)
+        else:
+            self.actbank_lambdas = None
+            self.actbank_alpha_head = None
+
         
         #h，形状 (B, hidden_dim)
         #由当前状态、指令、滞后 seed、GRU 记忆共同决定这一步的混合系数。
@@ -428,6 +459,39 @@ class LagPhysResGRUModel(LagPhysResQuadModel):
             [x_norm, u_raw_norm, u_eff_norm, u_raw_norm - u_eff_norm, h],
             dim=-1,
         )
+
+    def _actbank_update(self, bank_state, u_norm):
+        if self.actbank_lambdas is None:
+            raise ValueError("actbank_lambdas are unavailable when use_actbank_alpha=False")
+        u = u_norm.unsqueeze(-1)
+        return self.actbank_lambdas * bank_state + (1.0 - self.actbank_lambdas) * u
+
+    def _actbank_init(self, u0_norm, u_hist=None):
+        if self.actbank_lambdas is None:
+            raise ValueError("actbank_lambdas are unavailable when use_actbank_alpha=False")
+
+        if self.actbank_use_history:
+            if u_hist is None:
+                raise ValueError("u_hist is required when actbank_use_history=True")
+            if u_hist.ndim != 3:
+                raise ValueError("u_hist must have shape (B,L,4)")
+            if u_hist.shape[0] != u0_norm.shape[0]:
+                raise ValueError("u_hist batch size must match x0 batch size")
+            if u_hist.shape[-1] != u0_norm.shape[-1]:
+                raise ValueError("u_hist last dimension must be 4")
+            if u_hist.shape[1] <= 0:
+                raise ValueError("u_hist must contain at least one history step")
+
+            bank = u_hist[:, 0, :].unsqueeze(-1).expand(
+                -1, -1, self.actbank_lambdas.shape[-1]
+            ).contiguous()
+            for step in range(u_hist.shape[1]):
+                bank = self._actbank_update(bank, u_hist[:, step, :])
+            return bank
+
+        return u0_norm.unsqueeze(-1).expand(
+            -1, -1, self.actbank_lambdas.shape[-1]
+        ).contiguous()
 
 
 
@@ -485,18 +549,48 @@ class LagPhysResGRUModel(LagPhysResQuadModel):
         else:
             u_eff_prev_real = self.u_denorm(u0_norm)
 
+        if self.use_actbank_alpha:
+            if self.actbank_use_history and u_hist is None:
+                raise ValueError(
+                    "u_hist is required when use_actbank_alpha and actbank_use_history"
+                )
+            bank_state = self._actbank_init(u0_norm=u0_norm, u_hist=u_hist)
+        else:
+            bank_state = None
+
         for t in range(horizon):
             '''1取当前raw电机指令'''
             u_raw_norm = u_seq[:, t, :]
             u_raw_real = self.u_denorm(u_raw_norm)
 
             # 先用固定一阶lag得到一个seed（先用老办法算一个u_eff_seed），再由GRU上下文预测动态alpha_t。
+            u_eff_prev_norm = self.u_normed(u_eff_prev_real)
             u_eff_seed_real = self.lag_layer(u_eff_prev_real, u_raw_real)
             u_eff_seed_norm = self.u_normed(u_eff_seed_real)
             alpha_in = self._pack_gru_features(x_norm, u_raw_norm, u_eff_seed_norm, h)
             # alpha_dim=1: shared dynamic alpha over motors
             # alpha_dim=4: motor-wise dynamic alpha
-            alpha_t = torch.sigmoid(self.alpha_head(alpha_in))
+            alpha_logits = self.alpha_head(alpha_in)
+
+            if self.use_actbank_alpha:
+                bank_flat = bank_state.reshape(bank_state.shape[0], -1)
+                bank_feat = torch.cat(
+                    [
+                        bank_flat,
+                        u_raw_norm,
+                        u_eff_prev_norm,
+                        u_raw_norm - u_eff_prev_norm,
+                    ],
+                    dim=-1,
+                )
+                # Optional actuator-memory correction for alpha logits only.
+                # The zero-initialized head keeps this path initially identical to lag_gru.
+                delta_alpha_logits = self.actbank_alpha_scale * torch.tanh(
+                    self.actbank_alpha_head(bank_feat)
+                )
+                alpha_logits = alpha_logits + delta_alpha_logits
+
+            alpha_t = torch.sigmoid(alpha_logits)
 
             # 最终有效电机转速：在上一时刻执行器状态和当前 raw 指令之间动态插值。
             u_eff_real = alpha_t * u_eff_prev_real + (1.0 - alpha_t) * u_raw_real
@@ -524,6 +618,8 @@ class LagPhysResGRUModel(LagPhysResQuadModel):
             preds.append(x_next_norm.unsqueeze(1))
             x_norm = x_next_norm
             u_eff_prev_real = u_eff_real
+            if self.use_actbank_alpha:
+                bank_state = self._actbank_update(bank_state, u_raw_norm)
 
         # 拼成完整预测序列 (B,T,12)。
         return torch.cat(preds, dim=1)
