@@ -57,6 +57,9 @@ DEBUG_TRACE_VARIANTS = {
 }
 
 
+PRED_TRUE_TRACE_VARIANTS = {"baseline", "geo"}
+
+
 def inverse_scaled_array(scaler, tensor):
     array = tensor.detach().cpu().numpy()
     if scaler is None:
@@ -375,10 +378,11 @@ def main():
 
     checkpoint = torch.load(model_path, map_location=device)
     variant = checkpoint["config"]["variant"]
+    supports_internal_debug = variant in DEBUG_TRACE_VARIANTS
     if args.debug_trace and variant not in DEBUG_TRACE_VARIANTS:
-        raise NotImplementedError(
-            "--debug-trace is only supported for standard LagPhysResGRUModel "
-            f"variants: {sorted(DEBUG_TRACE_VARIANTS)}"
+        print(
+            "⚠️ Variant does not support internal debug variables; "
+            "saving pred_seq/true_seq only."
         )
     history_len = checkpoint["config"].get("history_len", args.history_len)
     if uses_history(variant) and history_len <= 0:
@@ -454,11 +458,12 @@ def main():
                 args.debug_trace
                 and debug_batch_count < args.debug_trace_max_batches
             )
+            capture_internal_debug = capture_debug and supports_internal_debug
 
             if needs_history:
                 x_hist = x_hist.to(device)
                 u_hist = u_hist.to(device)
-                if capture_debug:
+                if capture_internal_debug:
                     x_pred, debug = model(
                         x0,
                         u_seq,
@@ -468,13 +473,13 @@ def main():
                     )
                 else:
                     x_pred = model(x0, u_seq, x_hist=x_hist, u_hist=u_hist)
-                    debug = None
+                    debug = {}
             else:
-                if capture_debug:
+                if capture_internal_debug:
                     x_pred, debug = model(x0, u_seq, return_debug=True)
                 else:
                     x_pred = model(x0, u_seq)
-                    debug = None
+                    debug = {}
             x_pred = x_pred.cpu()
 
             if capture_debug:
