@@ -34,6 +34,7 @@ SUMMARY_COLUMNS = [
     "dx_res_delta_rotomega_norm_mean",
     "delta_alpha_abs_mean",
     "delta_rotomega_abs_mean",
+    "delta_omega_abs_mean",
 ]
 
 
@@ -250,6 +251,7 @@ def build_summary_row(trace):
 
     row["delta_alpha_abs_mean"] = abs_mean(trace, "delta_alpha_logits")
     row["delta_rotomega_abs_mean"] = abs_mean(trace, "delta_rotomega")
+    row["delta_omega_abs_mean"] = abs_mean(trace, "delta_omega")
     return row
 
 
@@ -305,6 +307,15 @@ def main(argv=None):
             delta_rotomega,
             ROTOMEGA_LABELS,
             "Rot/omega correction",
+        )
+
+    delta_omega = sample_trace_array(trace, "delta_omega", args.sample_index)
+    if delta_omega is not None:
+        save_line_plot(
+            plot_dir / "delta_omega.png",
+            delta_omega,
+            ROTOMEGA_LABELS[3:],
+            "Omega correction",
         )
 
     plot_rotomega_pred_true(trace, args.sample_index, plot_dir)

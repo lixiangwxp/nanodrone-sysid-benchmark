@@ -333,6 +333,8 @@ class LagPhysResGRUModel(LagPhysResQuadModel):
         actbank_use_history=False,
         actbank_taus_ms=(20.0, 50.0, 100.0, 200.0),
         actbank_alpha_scale=0.1,
+        use_actbank_omegares=False,
+        actbank_omegares_scale=0.05,
         use_hist_rotres=False,
         hist_rotres_scale=0.02,
     ):
@@ -359,23 +361,26 @@ class LagPhysResGRUModel(LagPhysResQuadModel):
         self.use_hist_init = bool(use_hist_init)
         self.hist_init_scale = float(hist_init_scale)
         self.use_actbank_alpha = bool(use_actbank_alpha)
+        self.use_actbank_omegares = bool(use_actbank_omegares)
+        self.uses_actbank = self.use_actbank_alpha or self.use_actbank_omegares
         self.actbank_use_history = bool(actbank_use_history)
         self.actbank_alpha_scale = float(actbank_alpha_scale)
+        self.actbank_omegares_scale = float(actbank_omegares_scale)
         self.actbank_taus_ms = tuple(float(tau_ms) for tau_ms in actbank_taus_ms)
         self.use_hist_rotres = bool(use_hist_rotres)
         self.hist_rotres_scale = float(hist_rotres_scale)
         self.requires_history = bool(
             self.use_hist_init
-            or self.actbank_use_history
+            or (self.uses_actbank and self.actbank_use_history)
             or self.use_hist_rotres
         )
         if self.alpha_dim not in (1, 4):
             raise ValueError("alpha_dim must be 1 or 4")
         if self.use_actbank_alpha and self.alpha_dim != 1:
             raise ValueError("use_actbank_alpha requires alpha_dim == 1")
-        if self.use_actbank_alpha and not self.actbank_taus_ms:
-            raise ValueError("actbank_taus_ms must be non-empty when use_actbank_alpha=True")
-        if self.use_actbank_alpha and any(tau_ms <= 0.0 for tau_ms in self.actbank_taus_ms):
+        if self.uses_actbank and not self.actbank_taus_ms:
+            raise ValueError("actbank_taus_ms must be non-empty when actbank is enabled")
+        if self.uses_actbank and any(tau_ms <= 0.0 for tau_ms in self.actbank_taus_ms):
             raise ValueError("actbank_taus_ms must be positive")
 
         # 4) 维度与结构检查
@@ -428,10 +433,14 @@ class LagPhysResGRUModel(LagPhysResQuadModel):
             self.hist_encoder = None
             self.hist_h_head = None
 
-        if self.use_actbank_alpha:
+        if self.uses_actbank:
             tau_sec = torch.tensor(self.actbank_taus_ms, dtype=torch.float32) / 1000.0
             lambdas = torch.exp(-torch.tensor(float(self.dt), dtype=torch.float32) / tau_sec)
             self.register_buffer("actbank_lambdas", lambdas.view(1, 1, -1))
+        else:
+            self.actbank_lambdas = None
+
+        if self.use_actbank_alpha:
             actbank_feat_dim = control_dim * len(self.actbank_taus_ms) + 3 * control_dim
             self.actbank_alpha_head = nn.Sequential(
                 nn.Linear(actbank_feat_dim, hidden_dim),
@@ -441,8 +450,24 @@ class LagPhysResGRUModel(LagPhysResQuadModel):
             nn.init.zeros_(self.actbank_alpha_head[-1].weight)
             nn.init.zeros_(self.actbank_alpha_head[-1].bias)
         else:
-            self.actbank_lambdas = None
             self.actbank_alpha_head = None
+
+        if self.use_actbank_omegares:
+            omegares_feat_dim = (
+                control_dim * len(self.actbank_taus_ms)
+                + hidden_dim
+                + 6
+                + 3 * control_dim
+            )
+            self.actbank_omegares_head = nn.Sequential(
+                nn.Linear(omegares_feat_dim, hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, 3),
+            )
+            nn.init.zeros_(self.actbank_omegares_head[-1].weight)
+            nn.init.zeros_(self.actbank_omegares_head[-1].bias)
+        else:
+            self.actbank_omegares_head = None
 
         if self.use_hist_rotres:
             self.hist_rot_encoder = nn.GRU(
@@ -488,13 +513,13 @@ class LagPhysResGRUModel(LagPhysResQuadModel):
 
     def _actbank_update(self, bank_state, u_norm):
         if self.actbank_lambdas is None:
-            raise ValueError("actbank_lambdas are unavailable when use_actbank_alpha=False")
+            raise ValueError("actbank_lambdas are unavailable when no actbank branch is enabled")
         u = u_norm.unsqueeze(-1)
         return self.actbank_lambdas * bank_state + (1.0 - self.actbank_lambdas) * u
 
     def _actbank_init(self, u0_norm, u_hist=None):
         if self.actbank_lambdas is None:
-            raise ValueError("actbank_lambdas are unavailable when use_actbank_alpha=False")
+            raise ValueError("actbank_lambdas are unavailable when no actbank branch is enabled")
 
         if self.actbank_use_history:
             if u_hist is None:
@@ -555,9 +580,13 @@ class LagPhysResGRUModel(LagPhysResQuadModel):
                 "dx_res_delta": [],
                 "x_phys_next_norm": [],
             }
+            if self.uses_actbank:
+                debug["bank_state"] = []
             if self.use_actbank_alpha:
                 debug["delta_alpha_logits"] = []
-                debug["bank_state"] = []
+            if self.use_actbank_omegares:
+                debug["delta_omega"] = []
+                debug["omegares_context_norm"] = []
             if self.use_hist_rotres:
                 debug["delta_rotomega"] = []
                 debug["hist_rot_context_norm"] = []
@@ -626,11 +655,9 @@ class LagPhysResGRUModel(LagPhysResQuadModel):
         else:
             u_eff_prev_real = self.u_denorm(u0_norm)
 
-        if self.use_actbank_alpha:
+        if self.uses_actbank:
             if self.actbank_use_history and u_hist is None:
-                raise ValueError(
-                    "u_hist is required when use_actbank_alpha and actbank_use_history"
-                )
+                raise ValueError("u_hist is required when actbank_use_history=True")
             bank_state = self._actbank_init(u0_norm=u0_norm, u_hist=u_hist)
         else:
             bank_state = None
@@ -649,9 +676,10 @@ class LagPhysResGRUModel(LagPhysResQuadModel):
             # alpha_dim=4: motor-wise dynamic alpha
             alpha_logits = self.alpha_head(alpha_in)
 
+            if self.uses_actbank and return_debug:
+                debug["bank_state"].append(bank_state.detach().unsqueeze(1))
+
             if self.use_actbank_alpha:
-                if return_debug:
-                    debug["bank_state"].append(bank_state.detach().unsqueeze(1))
                 bank_flat = bank_state.reshape(bank_state.shape[0], -1)
                 bank_feat = torch.cat(
                     [
@@ -708,6 +736,30 @@ class LagPhysResGRUModel(LagPhysResQuadModel):
             dx_res = self.residual.out(self.residual.mlp(residual_in))
             dx_res_before = dx_res
 
+            if self.use_actbank_omegares:
+                bank_flat = bank_state.reshape(bank_state.shape[0], -1)
+                omegares_feat = torch.cat(
+                    [
+                        bank_flat,
+                        h,
+                        x_norm[:, 6:12],
+                        u_raw_norm,
+                        u_eff_norm,
+                        u_raw_norm - u_eff_norm,
+                    ],
+                    dim=-1,
+                )
+                delta_omega = self.actbank_omegares_scale * torch.tanh(
+                    self.actbank_omegares_head(omegares_feat)
+                )
+                dx_res = dx_res.clone()
+                dx_res[:, 9:12] = dx_res[:, 9:12] + delta_omega
+                if return_debug:
+                    debug["delta_omega"].append(delta_omega.detach().unsqueeze(1))
+                    debug["omegares_context_norm"].append(
+                        omegares_feat.detach().norm(dim=-1, keepdim=True).unsqueeze(1)
+                    )
+
             if self.use_hist_rotres:
                 rotres_feat = torch.cat(
                     [
@@ -749,7 +801,7 @@ class LagPhysResGRUModel(LagPhysResQuadModel):
             preds.append(x_next_norm.unsqueeze(1))
             x_norm = x_next_norm
             u_eff_prev_real = u_eff_real
-            if self.use_actbank_alpha:
+            if self.uses_actbank:
                 bank_state = self._actbank_update(bank_state, u_raw_norm)
 
         # 拼成完整预测序列 (B,T,12)。
