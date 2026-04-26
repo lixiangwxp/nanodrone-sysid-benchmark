@@ -1,4 +1,5 @@
 import argparse
+import glob
 import os
 import sys
 import tempfile
@@ -48,6 +49,22 @@ def parse_args(argv=None):
         default=None,
         help="Optional CSV path for the time-aligned diagnostic values.",
     )
+    parser.add_argument(
+        "--raw-traj",
+        action="append",
+        dest="raw_trajs",
+        default=[],
+        help=(
+            "Optional raw run CSV path or glob, repeated in run order. "
+            "Used to draw run boundary lines."
+        ),
+    )
+    parser.add_argument(
+        "--start-index-offset",
+        type=int,
+        default=0,
+        help="Raw start index offset used by the prediction CSV. Baseline is 0.",
+    )
     return parser.parse_args(argv)
 
 
@@ -60,6 +77,8 @@ def validate_args(args):
         raise ValueError("--horizon must be <= --max-horizon.")
     if args.smooth_window <= 0:
         raise ValueError("--smooth-window must be > 0.")
+    if args.start_index_offset < 0:
+        raise ValueError("--start-index-offset must be >= 0.")
 
 
 def require_columns(df, columns, source):
@@ -215,7 +234,79 @@ def rolling_mean(values, window):
     return series.rolling(window, center=True, min_periods=1).mean().to_numpy()
 
 
-def plot_residual_components(summary_df, model_label, horizon, plot_dir, smooth_window):
+def resolve_raw_traj_paths(raw_trajs):
+    paths = []
+    for item in raw_trajs:
+        matches = sorted(
+            Path(path).expanduser().resolve()
+            for path in glob.glob(os.path.expanduser(item))
+        )
+        if not matches:
+            path = Path(item).expanduser().resolve()
+            if not path.exists():
+                raise FileNotFoundError(f"Missing raw trajectory file: {path}")
+            matches = [path]
+        paths.extend(matches)
+    return paths
+
+
+def compute_run_boundaries(raw_paths, csv_horizon, start_index_offset, dt):
+    if not raw_paths:
+        return [], pd.DataFrame()
+
+    rows = []
+    cumulative_rows = 0
+    boundaries = []
+    for run_idx, raw_path in enumerate(raw_paths):
+        raw_df = pd.read_csv(raw_path)
+        expected_rows = len(raw_df) - int(csv_horizon) - int(start_index_offset)
+        if expected_rows <= 0:
+            raise ValueError(
+                f"{raw_path} is too short for csv horizon {csv_horizon} "
+                f"and start-index offset {start_index_offset}."
+            )
+        start_time = cumulative_rows * dt
+        end_time = (cumulative_rows + expected_rows - 1) * dt
+        rows.append(
+            {
+                "run_index": run_idx + 1,
+                "raw_path": str(raw_path),
+                "raw_rows": len(raw_df),
+                "prediction_rows": expected_rows,
+                "plot_start_time": start_time,
+                "plot_end_time": end_time,
+            }
+        )
+        cumulative_rows += expected_rows
+        if run_idx < len(raw_paths) - 1:
+            boundaries.append(cumulative_rows * dt)
+
+    return boundaries, pd.DataFrame(rows)
+
+
+def add_run_boundaries(axs, boundaries):
+    if not boundaries:
+        return
+    for ax in axs:
+        for idx, boundary in enumerate(boundaries):
+            ax.axvline(
+                boundary,
+                color="0.15",
+                linestyle=":",
+                linewidth=1.0,
+                alpha=0.85,
+                label="run boundary" if idx == 0 else None,
+            )
+
+
+def plot_residual_components(
+    summary_df,
+    model_label,
+    horizon,
+    plot_dir,
+    smooth_window,
+    run_boundaries=None,
+):
     setup_matplotlib()
     fig, axs = plt.subplots(2, 1, figsize=(10, 5.5), sharex=True, dpi=180)
     x = summary_df["start_time"].to_numpy(float)
@@ -242,6 +333,7 @@ def plot_residual_components(summary_df, model_label, horizon, plot_dir, smooth_
         ax.set_ylabel(unit)
         ax.grid(True, alpha=0.3)
 
+    add_run_boundaries(axs, run_boundaries or [])
     axs[-1].set_xlabel("Rollout start time [s]")
     handles, labels = axs[0].get_legend_handles_labels()
     fig.legend(handles, labels, loc="upper center", ncols=3)
@@ -254,7 +346,14 @@ def plot_residual_components(summary_df, model_label, horizon, plot_dir, smooth_
     return plot_path
 
 
-def plot_mean_errors(summary_df, model_label, max_horizon, plot_dir, smooth_window):
+def plot_mean_errors(
+    summary_df,
+    model_label,
+    max_horizon,
+    plot_dir,
+    smooth_window,
+    run_boundaries=None,
+):
     setup_matplotlib()
     fig, axs = plt.subplots(2, 1, figsize=(10, 5.5), sharex=True, dpi=180)
     x = summary_df["start_time"].to_numpy(float)
@@ -279,6 +378,7 @@ def plot_mean_errors(summary_df, model_label, max_horizon, plot_dir, smooth_wind
         ax.grid(True, alpha=0.3)
         ax.legend()
 
+    add_run_boundaries(axs, run_boundaries or [])
     axs[-1].set_xlabel("Rollout start time [s]")
     fig.tight_layout()
 
@@ -297,6 +397,13 @@ def main(argv=None):
     plot_dir = Path(args.plot_dir).expanduser().resolve()
     df = require_csv(prediction_path)
     summary_df = build_summary(df, args.horizon, args.max_horizon)
+    raw_paths = resolve_raw_traj_paths(args.raw_trajs)
+    run_boundaries, run_summary_df = compute_run_boundaries(
+        raw_paths,
+        args.max_horizon,
+        args.start_index_offset,
+        float(summary_df["dt_estimate"].iloc[0]),
+    )
 
     residual_path = plot_residual_components(
         summary_df,
@@ -304,6 +411,7 @@ def main(argv=None):
         args.horizon,
         plot_dir,
         args.smooth_window,
+        run_boundaries=run_boundaries,
     )
     mean_error_path = plot_mean_errors(
         summary_df,
@@ -311,6 +419,7 @@ def main(argv=None):
         args.max_horizon,
         plot_dir,
         args.smooth_window,
+        run_boundaries=run_boundaries,
     )
 
     summary_path = (
@@ -320,10 +429,16 @@ def main(argv=None):
     )
     summary_path.parent.mkdir(parents=True, exist_ok=True)
     summary_df.to_csv(summary_path, index=False)
+    run_summary_path = None
+    if not run_summary_df.empty:
+        run_summary_path = plot_dir / "run_boundary_summary.csv"
+        run_summary_df.to_csv(run_summary_path, index=False)
 
     print(f"Saved residual plot to: {residual_path}")
     print(f"Saved mean-error plot to: {mean_error_path}")
     print(f"Saved summary to: {summary_path}")
+    if run_summary_path is not None:
+        print(f"Saved run boundary summary to: {run_summary_path}")
 
 
 if __name__ == "__main__":

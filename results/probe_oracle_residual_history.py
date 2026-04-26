@@ -43,9 +43,30 @@ RAW_STATE_COLUMNS = [
     "wy",
     "wz",
 ]
+POSVEL_STATES = ["x", "y", "z", "vx", "vy", "vz"]
+ROTOMEGA_STATES = ["rx", "ry", "rz", "wx", "wy", "wz"]
 OMEGA_STATES = ["wx", "wy", "wz"]
 MOTOR_COLUMNS = ["m1_rads", "m2_rads", "m3_rads", "m4_rads"]
 MODE_COLUMNS = ["T", "tau_x", "tau_y", "tau_z"]
+FEATURE_GROUPS = [
+    "state_hist",
+    "motor_hist",
+    "mode_hist",
+    "delta_u_hist",
+    "actbank",
+    "x0",
+    "future_motor_seq",
+    "future_mode_seq",
+    "base_pred_rotomega_seq",
+    "base_pred_posvel_seq",
+]
+HISTORY_FEATURE_GROUPS = {
+    "state_hist",
+    "motor_hist",
+    "mode_hist",
+    "delta_u_hist",
+    "actbank",
+}
 
 ARM_LENGTH = 0.0353
 KT = 3.72e-08
@@ -61,7 +82,7 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser(
         description=(
             "Offline diagnosis C: test whether baseline omega oracle residuals "
-            "can be explained from causal history features."
+            "can be explained from causal history or base-rollout sequence features."
         )
     )
     parser.add_argument(
@@ -114,8 +135,12 @@ def parse_args(argv=None):
         "--feature-groups",
         nargs="+",
         default=["state_hist", "motor_hist", "mode_hist", "delta_u_hist", "actbank"],
-        choices=["state_hist", "motor_hist", "mode_hist", "delta_u_hist", "actbank"],
-        help="History feature groups to include.",
+        choices=FEATURE_GROUPS,
+        help=(
+            "Feature groups to include. C2 rollout-sequence groups are x0, "
+            "future_motor_seq, future_mode_seq, base_pred_rotomega_seq, "
+            "and base_pred_posvel_seq."
+        ),
     )
     parser.add_argument("--actbank-taus-ms", type=str, default="20,50,100,200")
     parser.add_argument("--model", choices=["ridgecv", "ridge", "mlp"], default="ridgecv")
@@ -250,7 +275,30 @@ def actbank_state(motor_hist, taus_ms, dt):
     return np.asarray(banks, dtype=float)
 
 
-def build_feature_vector(raw_df, raw_start, history_len, feature_groups, taus_ms):
+def prediction_sequence(pred_df, pred_row, states, csv_horizon):
+    pred_cols = [
+        f"{state}_pred_h{horizon}"
+        for horizon in range(1, csv_horizon + 1)
+        for state in states
+    ]
+    require_columns(pred_df, pred_cols, "prediction CSV")
+    row = pred_df.iloc[pred_row]
+    values = []
+    for horizon in range(1, csv_horizon + 1):
+        values.append([float(row[f"{state}_pred_h{horizon}"]) for state in states])
+    return np.asarray(values, dtype=float)
+
+
+def build_feature_vector(
+    raw_df,
+    pred_df,
+    pred_row,
+    raw_start,
+    history_len,
+    csv_horizon,
+    feature_groups,
+    taus_ms,
+):
     state = raw_state_matrix(raw_df)
     motors = raw_df[MOTOR_COLUMNS].to_numpy(float)
     dt = estimate_dt(raw_df)
@@ -314,6 +362,59 @@ def build_feature_vector(raw_df, raw_start, history_len, feature_groups, taus_ms
         features.extend(vals)
         names.extend(cols)
 
+    if "x0" in feature_groups:
+        vals, cols = flatten_with_names(
+            "x0",
+            state[raw_start : raw_start + 1],
+            [0],
+            STATE_COLUMNS,
+        )
+        features.extend(vals)
+        names.extend(cols)
+
+    future_motor_slice = slice(raw_start, raw_start + csv_horizon)
+    future_offsets = list(range(csv_horizon))
+
+    if "future_motor_seq" in feature_groups:
+        vals, cols = flatten_with_names(
+            "u_seq",
+            motors[future_motor_slice],
+            future_offsets,
+            MOTOR_COLUMNS,
+        )
+        features.extend(vals)
+        names.extend(cols)
+
+    if "future_mode_seq" in feature_groups:
+        vals, cols = flatten_with_names(
+            "mode_seq",
+            motor_to_phys_np(motors[future_motor_slice]),
+            future_offsets,
+            MODE_COLUMNS,
+        )
+        features.extend(vals)
+        names.extend(cols)
+
+    if "base_pred_rotomega_seq" in feature_groups:
+        vals, cols = flatten_with_names(
+            "base_pred_rotomega",
+            prediction_sequence(pred_df, pred_row, ROTOMEGA_STATES, csv_horizon),
+            list(range(1, csv_horizon + 1)),
+            ROTOMEGA_STATES,
+        )
+        features.extend(vals)
+        names.extend(cols)
+
+    if "base_pred_posvel_seq" in feature_groups:
+        vals, cols = flatten_with_names(
+            "base_pred_posvel",
+            prediction_sequence(pred_df, pred_row, POSVEL_STATES, csv_horizon),
+            list(range(1, csv_horizon + 1)),
+            POSVEL_STATES,
+        )
+        features.extend(vals)
+        names.extend(cols)
+
     return np.asarray(features, dtype=float), names
 
 
@@ -371,18 +472,24 @@ def build_label_samples(
     feature_rows = []
     feature_names = None
     pred_cursor = 0
+    required_history_len = (
+        history_len if HISTORY_FEATURE_GROUPS.intersection(feature_groups) else 0
+    )
 
     for file_path, raw_df, expected_count in zip(raw_files, raw_dfs, expected_counts):
         for local_row in range(expected_count):
             pred_row = pred_cursor + local_row
             raw_start = int(start_index_offset + local_row)
-            if raw_start < history_len:
+            if raw_start < required_history_len:
                 continue
 
             feature_vector, names = build_feature_vector(
                 raw_df,
+                pred_df,
+                pred_row,
                 raw_start,
                 history_len,
+                csv_horizon,
                 feature_groups,
                 taus_ms,
             )
