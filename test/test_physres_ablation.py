@@ -183,6 +183,13 @@ def rebuild_model(checkpoint, x_scaler, u_scaler, device):
     gru_hidden_dim = config.get("gru_hidden_dim", 64)
     num_layers = config.get("num_layers", 5)
     default_residual_input_dim = 4
+    actbank_taus_ms = config.get("actbank_taus_ms") or [20.0, 50.0, 100.0, 200.0]
+    actbank_alpha_scale = config.get("actbank_alpha_scale")
+    if actbank_alpha_scale is None:
+        actbank_alpha_scale = 0.1
+    actbank_omegares_scale = config.get("actbank_omegares_scale")
+    if actbank_omegares_scale is None:
+        actbank_omegares_scale = 0.05
     if variant in {"lag_gru", "lag_gru_uinit", "lag_gru_histinit_honly", "lag_gru_histrotres", "lag_gru_actbank_alphaonly", "lag_gru_actbank_omegares", "lag_gru_alpha4", "lag_gru_ctrl", "lag_gru_torque", "lag_gru_force"}:
         default_residual_input_dim = gru_hidden_dim + 12
     elif uses_lag(variant):
@@ -252,10 +259,8 @@ def rebuild_model(checkpoint, x_scaler, u_scaler, device):
             hist_init_scale=0.1,
             use_actbank_alpha=True,
             actbank_use_history=True,
-            actbank_taus_ms=tuple(
-                config.get("actbank_taus_ms", [20.0, 50.0, 100.0, 200.0])
-            ),
-            actbank_alpha_scale=float(config.get("actbank_alpha_scale", 0.1)),
+            actbank_taus_ms=tuple(actbank_taus_ms),
+            actbank_alpha_scale=float(actbank_alpha_scale),
         ).to(device)
     elif variant == "lag_gru_actbank_omegares":
         model = LagPhysResGRUModel(
@@ -274,11 +279,9 @@ def rebuild_model(checkpoint, x_scaler, u_scaler, device):
             use_actbank_alpha=False,
             use_actbank_omegares=True,
             actbank_use_history=True,
-            actbank_taus_ms=tuple(
-                config.get("actbank_taus_ms", [20.0, 50.0, 100.0, 200.0])
-            ),
-            actbank_alpha_scale=float(config.get("actbank_alpha_scale", 0.1)),
-            actbank_omegares_scale=float(config.get("actbank_omegares_scale", 0.05)),
+            actbank_taus_ms=tuple(actbank_taus_ms),
+            actbank_alpha_scale=float(actbank_alpha_scale),
+            actbank_omegares_scale=float(actbank_omegares_scale),
             use_hist_rotres=False,
         ).to(device)
     elif variant == "lag_gru_histrotres":
