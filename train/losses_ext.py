@@ -173,6 +173,10 @@ class LossConfig:
     w_omega: float
     lambda_mse: float = 0.1
     aux_loss_type: str = "smooth_l1"
+    rot_loss_weight: float = 0.0
+    omega_loss_weight: float = 0.0
+    tail_rotomega_loss_weight: float = 0.0
+    tail_start: int = 20
 
 
 def build_loss_config(
@@ -187,6 +191,10 @@ def build_loss_config(
     use_force=False,
     lambda_mse=0.1,
     aux_loss_type="smooth_l1",
+    rot_loss_weight=0.0,
+    omega_loss_weight=0.0,
+    tail_rotomega_loss_weight=0.0,
+    tail_start=20,
 ):
     return LossConfig(
         temporal_loss=loss_type,
@@ -200,6 +208,10 @@ def build_loss_config(
         w_omega=w_omega,
         lambda_mse=lambda_mse,
         aux_loss_type=aux_loss_type,
+        rot_loss_weight=rot_loss_weight,
+        omega_loss_weight=omega_loss_weight,
+        tail_rotomega_loss_weight=tail_rotomega_loss_weight,
+        tail_start=tail_start,
     )
 
 
@@ -343,6 +355,60 @@ def _compute_force_loss(model, batch, force_pred_seq, u_eff_seq_real, device, be
     return weighted_force_loss, force_loss.detach()
 
 
+def _compute_rotomega_extra_loss(pred_seq, true_seq, loss_config):
+    zero = pred_seq.new_tensor(0.0)
+    if (
+        loss_config.rot_loss_weight == 0.0
+        and loss_config.omega_loss_weight == 0.0
+        and loss_config.tail_rotomega_loss_weight == 0.0
+    ):
+        return zero, False, {
+            "loss_extra_rot": zero.detach(),
+            "loss_extra_omega": zero.detach(),
+            "loss_extra_tail_rotomega": zero.detach(),
+            "loss_extra_total": zero.detach(),
+        }
+
+    rot_extra = zero
+    omega_extra = zero
+    tail_extra = zero
+
+    if loss_config.rot_loss_weight != 0.0:
+        rot_loss = torch.nn.functional.mse_loss(
+            pred_seq[..., 6:9],
+            true_seq[..., 6:9],
+        )
+        rot_extra = loss_config.rot_loss_weight * rot_loss
+
+    if loss_config.omega_loss_weight != 0.0:
+        omega_loss = torch.nn.functional.mse_loss(
+            pred_seq[..., 9:12],
+            true_seq[..., 9:12],
+        )
+        omega_extra = loss_config.omega_loss_weight * omega_loss
+
+    if loss_config.tail_rotomega_loss_weight != 0.0:
+        tail_start = loss_config.tail_start
+        if tail_start < 0 or tail_start >= pred_seq.shape[1]:
+            raise ValueError(
+                f"tail_start must satisfy 0 <= tail_start < horizon, got "
+                f"{tail_start} for horizon {pred_seq.shape[1]}"
+            )
+        tail_loss = torch.nn.functional.mse_loss(
+            pred_seq[:, tail_start:, 6:12],
+            true_seq[:, tail_start:, 6:12],
+        )
+        tail_extra = loss_config.tail_rotomega_loss_weight * tail_loss
+
+    extra_total = rot_extra + omega_extra + tail_extra
+    return extra_total, True, {
+        "loss_extra_rot": rot_extra.detach(),
+        "loss_extra_omega": omega_extra.detach(),
+        "loss_extra_tail_rotomega": tail_extra.detach(),
+        "loss_extra_total": extra_total.detach(),
+    }
+
+
 def compute_loss(model, criterion, batch, device, loss_config):
     x0, u_seq, true_seq = batch[:3]
     # IO-only optimization: preserve values while enabling async H2D copies when available.
@@ -402,6 +468,19 @@ def compute_loss(model, criterion, batch, device, loss_config):
         total_loss = total_loss + weighted_force_loss
         loss_dict["loss_total"] = total_loss.detach()
         loss_dict["loss_force"] = force_loss_value
+
+    base_loss = total_loss
+    extra_loss, has_extra_loss, extra_loss_dict = _compute_rotomega_extra_loss(
+        pred_seq,
+        true_seq,
+        loss_config,
+    )
+    if has_extra_loss:
+        total_loss = total_loss + extra_loss
+
+    loss_dict["loss_base"] = base_loss.detach()
+    loss_dict.update(extra_loss_dict)
+    loss_dict["loss_total"] = total_loss.detach()
 
     return total_loss, loss_dict
 

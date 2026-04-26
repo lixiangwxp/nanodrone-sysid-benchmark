@@ -485,6 +485,10 @@ def build_checkpoint(
     batch_size,
     gru_hidden_dim,
     loss_type,
+    rot_loss_weight,
+    omega_loss_weight,
+    tail_rotomega_loss_weight,
+    tail_start,
     torque_scale_factor,
     control_ctx_dim,
     history_len,
@@ -543,6 +547,10 @@ def build_checkpoint(
             "use_hist_rotres": bool(getattr(model, "use_hist_rotres", False)),
             "hist_rotres_scale": hist_rotres_scale if getattr(model, "use_hist_rotres", False) else None,
             "loss_type": loss_type,
+            "rot_loss_weight": rot_loss_weight,
+            "omega_loss_weight": omega_loss_weight,
+            "tail_rotomega_loss_weight": tail_rotomega_loss_weight,
+            "tail_start": tail_start,
             "torque_scale_factor": torque_scale_factor,
             "control_ctx_dim": control_ctx_dim,
             "init_from": init_from,
@@ -720,6 +728,26 @@ def validate_resume_checkpoint(checkpoint, args, train_trajs, valid_trajs, aux_c
 
     if config.get("loss_type") is not None:
         expected_pairs.append(("loss_type", args.loss_type, config.get("loss_type")))
+    if config.get("rot_loss_weight") is not None:
+        expected_pairs.append(
+            ("rot_loss_weight", args.rot_loss_weight, config.get("rot_loss_weight"))
+        )
+    if config.get("omega_loss_weight") is not None:
+        expected_pairs.append(
+            ("omega_loss_weight", args.omega_loss_weight, config.get("omega_loss_weight"))
+        )
+    if config.get("tail_rotomega_loss_weight") is not None:
+        expected_pairs.append(
+            (
+                "tail_rotomega_loss_weight",
+                args.tail_rotomega_loss_weight,
+                config.get("tail_rotomega_loss_weight"),
+            )
+        )
+    if config.get("tail_start") is not None:
+        expected_pairs.append(
+            ("tail_start", args.tail_start, config.get("tail_start"))
+        )
     if config.get("lr_start") is not None:
         expected_pairs.append(("lr_start", args.lr_start, config.get("lr_start")))
     if config.get("lr_end") is not None:
@@ -875,6 +903,38 @@ def main():
     parser.add_argument("--lr-end", "--lr_end", dest="lr_end", type=float, default=1e-8)
     parser.add_argument("--loss-type", type=str, default="exp", choices=["exp", "mixed", "mixed_early"])
     parser.add_argument(
+        "--rot-loss-weight",
+        "--rot_loss_weight",
+        dest="rot_loss_weight",
+        type=float,
+        default=0.0,
+        help="Extra MSE weight on rotation-vector channels [6:9]. Default 0 disables it.",
+    )
+    parser.add_argument(
+        "--omega-loss-weight",
+        "--omega_loss_weight",
+        dest="omega_loss_weight",
+        type=float,
+        default=0.0,
+        help="Extra MSE weight on body angular velocity channels [9:12]. Default 0 disables it.",
+    )
+    parser.add_argument(
+        "--tail-rotomega-loss-weight",
+        "--tail_rotomega_loss_weight",
+        dest="tail_rotomega_loss_weight",
+        type=float,
+        default=0.0,
+        help="Extra MSE weight on tail horizon rot+omega channels [6:12]. Default 0 disables it.",
+    )
+    parser.add_argument(
+        "--tail-start",
+        "--tail_start",
+        dest="tail_start",
+        type=int,
+        default=20,
+        help="Start horizon index for tail rot/omega loss.",
+    )
+    parser.add_argument(
         "--name-suffix",
         type=str,
         default="",
@@ -961,6 +1021,9 @@ def main():
         raise ValueError("--log-diagnostics-every must be >= 0.")
     if args.history_len < 0:
         raise ValueError("--history-len must be >= 0.")
+    if args.tail_rotomega_loss_weight != 0.0:
+        if args.tail_start < 0 or args.tail_start >= args.horizon:
+            raise ValueError("--tail-start must satisfy 0 <= tail-start < horizon.")
     if args.variant == "lag_gru_histinit_honly" and args.history_len <= 0:
         raise ValueError("--history-len must be > 0 for lag_gru_histinit_honly")
     if args.variant == "lag_gru_actbank_alphaonly" and args.history_len <= 0:
@@ -1161,6 +1224,10 @@ def main():
         use_geo=uses_geo_loss(args.variant),
         use_aux=uses_aux_supervision(args.variant),
         use_force=uses_force_supervision(args.variant) and force_loss_enabled,
+        rot_loss_weight=args.rot_loss_weight,
+        omega_loss_weight=args.omega_loss_weight,
+        tail_rotomega_loss_weight=args.tail_rotomega_loss_weight,
+        tail_start=args.tail_start,
     )
     #保存 trajectories.json：把这次 train/valid 用了哪些轨迹记下来，方便复现。
     traj_info = {"train_trajs": train_trajs, "valid_trajs": valid_trajs}
@@ -1503,6 +1570,10 @@ def main():
             batch_size=batch_size,
             gru_hidden_dim=args.gru_hidden_dim,
             loss_type=args.loss_type,
+            rot_loss_weight=args.rot_loss_weight,
+            omega_loss_weight=args.omega_loss_weight,
+            tail_rotomega_loss_weight=args.tail_rotomega_loss_weight,
+            tail_start=args.tail_start,
             torque_scale_factor=args.torque_scale_factor,
             control_ctx_dim=args.control_ctx_dim,
             history_len=history_len,
